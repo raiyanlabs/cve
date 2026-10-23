@@ -1,0 +1,49 @@
+name: Build DLL payloads (Windows/MSVC)
+
+# Builds the mixed-mode sleep + reverse-shell DLLs with MSVC on a Windows
+# runner, then commits them back to the repo so a Mac (or any other host)
+# can just `git pull` and run. Triggered on push to the payload sources or
+# manually from the Actions tab.
+
+on:
+  push:
+    paths:
+      - "sleep.c"
+      - "revshell.c"
+      - "build-dll.bat"
+      - ".github/workflows/build-dlls.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sleep + reverse-shell payloads (x86 + amd64)
+        shell: cmd
+        working-directory: .
+        run: |
+          build-dll.bat sleep.c
+          build-dll.bat revshell.c
+
+      - name: Show what was built
+        shell: bash
+        run: ls -la payloads/
+
+      - name: Commit payloads back
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41888570@github.com"
+          git add payloads/
+          if git diff --cached --quiet; then
+            echo "No payload changes."
+          else
+            git commit -m "ci: rebuild CVE-2019-18935 payloads ($(date +%Y%m%d%H%M%S))"
+            git push
+          fi

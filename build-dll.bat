@@ -14,7 +14,7 @@
 @echo off
 
 :: Point this to the path of your Visual Studio installation.
-set VSPATH=C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build
+set VSPATH=C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build
 
 :: Create directory for compiled payloads.
 set OUTDIR=payloads

