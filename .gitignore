@@ -1,5 +1,13 @@
 __pycache__/
 env/
-payloads/
+payloads/*
 # ...but keep the prebuilt payloads that CI commits, so any host can run offline:
 !payloads/*.dll
+# runner scratch
+.fired
+.c2.txt
+.net.txt
+.rev.txt
+.writemap.txt
+loot/
+empty.cs
