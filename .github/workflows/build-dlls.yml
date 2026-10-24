@@ -1,15 +1,16 @@
 name: Build DLL payloads (Windows/MSVC)
 
-# Builds the mixed-mode sleep + reverse-shell DLLs with MSVC on a Windows
-# runner, then commits them back to the repo so a Mac (or any other host)
-# can just `git pull` and run. Triggered on push to the payload sources or
-# manually from the Actions tab.
+# Builds the mixed-mode sleep + reverse-shell + dump-src DLLs with MSVC on a
+# Windows runner, then commits them back to the repo so a Mac (or any other
+# host) can just `git pull` and run. Triggered on push to the payload sources
+# or manually from the Actions tab.
 
 on:
   push:
     paths:
       - "sleep.c"
       - "revshell.c"
+      - "dump-src.c"
       - "build-dll.bat"
       - ".github/workflows/build-dlls.yml"
   workflow_dispatch: {}
@@ -23,12 +24,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build sleep + reverse-shell payloads (x86 + amd64)
+      - name: Build sleep + revshell + dump-src payloads
         shell: cmd
-        working-directory: .
         run: |
-          build-dll.bat sleep.c
-          build-dll.bat revshell.c
+          set "PSH=C:\Program Files\PowerShell\7\pwsh.exe"
+          "%PSH%" -Command "cd \$pwd ; & ./build-dll.bat revshell.c ; exit \$LASTEXITCODE"
+          "%PSH%" -Command "cd \$pwd ; & ./build-dll.bat dump-src.c ; exit \$LASTEXITCODE"
+
+      - name: Build dump-src payloads
+        shell: cmd
+        run: build-dll.bat dump-src.c
 
       - name: Show what was built
         shell: bash
