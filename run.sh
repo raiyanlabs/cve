@@ -41,7 +41,14 @@ banner() { # $1 = text
 ARG="${1:-auto}"
 case "$ARG" in
   auto|check|versions|exploit|shell|all|dumpsrc|writemap|exfil) STAGE="$ARG" ;;
-  http://*|https://*) TARGET_URL="$ARG"; STAGE="${STAGE:-all}" ;;
+  http://*|https://*)
+    TARGET_URL="$ARG"
+    case "${2:-}" in
+      "") STAGE="${STAGE:-all}" ;;
+      auto|check|versions|exploit|shell|all|dumpsrc|writemap|exfil) STAGE="$2" ;;
+      *) die "unknown stage '$2'" ;;
+    esac
+    ;;
   *) die "usage: $0 [auto|check|versions|exploit|shell|dumpsrc|writemap|exfil|all|http(s)://HOST:PORT]" ;;
 esac
 
