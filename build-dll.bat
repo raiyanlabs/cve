@@ -12,9 +12,21 @@
 ::           .\build-dll.bat sliver-stager.c amd64
 
 @echo off
+setlocal EnableExtensions
 
-:: Point this to the path of your Visual Studio installation.
-set VSPATH=C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build
+:: Locate a Visual Studio with the C++ toolset. VSWHERE covers every modern
+:: edition (the hardcoded VS "18\Community" path is only a last resort, and it
+:: is what broke the GitHub Actions runner, which ships VS 2022).
+if defined VSPATH if exist "%VSPATH%\vcvarsall.bat" goto have_vs
+set "VSPATH="
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if exist "%VSWHERE%" for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i\VC\Auxiliary\Build"
+if not defined VSPATH if exist "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" set "VSPATH=C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build"
+if not defined VSPATH (
+    echo [x] No Visual Studio C++ toolset found. Set VSPATH to its VC\Auxiliary\Build dir.
+    exit /b 1
+)
+:have_vs
 
 :: Create directory for compiled payloads.
 set OUTDIR=payloads
